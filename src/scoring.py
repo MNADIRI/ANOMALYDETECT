@@ -7,42 +7,56 @@ import numpy as np
 from scipy.ndimage import gaussian_filter, zoom
 
 
-def _create_body_mask(
+def _create_body_mask_at_grid(
     volume_hu: np.ndarray,
-    patch_size: int,
+    grid_shape: tuple[int, int, int],
     hu_threshold: float = -900.0,
     min_tissue_fraction: float = 0.1,
 ) -> np.ndarray:
     """
-    Create a patch-level mask that excludes air regions.
-
-    A patch is considered "body" if at least `min_tissue_fraction` of its
-    pixels have HU > hu_threshold.
+    Create a body mask at the same resolution as the feature grid.
 
     Parameters
     ----------
     volume_hu : [D, H, W] float32
-    patch_size : size of each ViT patch (e.g. 14)
-    hu_threshold : HU value below which a pixel is considered air
-    min_tissue_fraction : minimum fraction of non-air pixels in a patch
+    grid_shape : (D_feat, Hp, Wp) — the feature grid dimensions
+    hu_threshold : HU below which a pixel is air
+    min_tissue_fraction : min fraction of non-air per patch
 
     Returns
     -------
-    mask : [D, Hp, Wp] bool — True = body, False = air
+    mask : [D_feat, Hp, Wp] bool
     """
-    D, H, W = volume_hu.shape
-    Hp = H // patch_size
-    Wp = W // patch_size
+    D_feat, Hp, Wp = grid_shape
+    D_hu, H_hu, W_hu = volume_hu.shape
 
-    # Crop to exact multiple of patch_size
-    vol = volume_hu[:, :Hp * patch_size, :Wp * patch_size]
+    # Compute effective patch size from HU volume to grid
+    patch_h = H_hu / Hp
+    patch_w = W_hu / Wp
+    slice_ratio = D_hu / D_feat
 
-    # Reshape into patches and compute tissue fraction
-    vol = vol.reshape(D, Hp, patch_size, Wp, patch_size)
-    tissue = (vol > hu_threshold).astype(np.float32)
-    fraction = tissue.mean(axis=(2, 4))  # [D, Hp, Wp]
+    mask = np.zeros((D_feat, Hp, Wp), dtype=bool)
 
-    return fraction >= min_tissue_fraction
+    for d in range(D_feat):
+        # Map grid slice to HU slices
+        d_start = int(d * slice_ratio)
+        d_end = min(int((d + 1) * slice_ratio), D_hu)
+        if d_end <= d_start:
+            d_end = d_start + 1
+
+        for hp in range(Hp):
+            h_start = int(hp * patch_h)
+            h_end = min(int((hp + 1) * patch_h), H_hu)
+            for wp in range(Wp):
+                w_start = int(wp * patch_w)
+                w_end = min(int((wp + 1) * patch_w), W_hu)
+
+                patch = volume_hu[d_start:d_end, h_start:h_end, w_start:w_end]
+                if patch.size > 0:
+                    tissue_frac = (patch > hu_threshold).mean()
+                    mask[d, hp, wp] = tissue_frac >= min_tissue_fraction
+
+    return mask
 
 
 def compute_change_scores(
@@ -59,7 +73,7 @@ def compute_change_scores(
     features_new : [D, Hp, Wp, C] – new scan features
     features_ref : [D, Hp, Wp, C] – registered reference features
     volume_hu_new : [D, H, W] float32 – HU volume for body masking (optional)
-    patch_size : ViT patch size for mask computation
+    patch_size : ViT patch size (unused now, kept for API compat)
 
     Returns
     -------
@@ -82,17 +96,12 @@ def compute_change_scores(
     # 3. Cosine distance
     distance = 1.0 - cosine_sim  # [D, Hp, Wp], range [0, 2]
 
-    # 4. Create body mask to exclude air regions
+    # 4. Create body mask at feature grid resolution
     body_mask = None
     if volume_hu_new is not None:
-        body_mask = _create_body_mask(volume_hu_new, patch_size)
-        # Ensure mask shape matches feature grid
-        if body_mask.shape != (D, Hp, Wp):
-            body_mask = zoom(
-                body_mask.astype(np.float32),
-                (D / body_mask.shape[0], Hp / body_mask.shape[1], Wp / body_mask.shape[2]),
-                order=0,
-            ) > 0.5
+        body_mask = _create_body_mask_at_grid(
+            volume_hu_new, (D, Hp, Wp)
+        )
 
     # 5. Robust z-score on body voxels only
     if body_mask is not None and body_mask.any():
@@ -108,18 +117,32 @@ def compute_change_scores(
 
     z_scores = (distance - median) / (mad * 1.4826)
 
-    # 6. Zero out air regions
+    # 6. Clamp negative z-scores (we only care about increases)
+    z_scores = np.maximum(z_scores, 0.0)
+
+    # 7. Spatial smoothing BEFORE masking air
+    #    (avoids air zeros contaminating body edges)
+    z_scores = gaussian_filter(
+        z_scores.astype(np.float64),
+        sigma=[0.5, 1.0, 1.0],  # reduced sigma to preserve focal lesions
+    ).astype(np.float32)
+
+    # 8. Zero out air regions AFTER smoothing
     if body_mask is not None:
         z_scores[~body_mask] = 0.0
 
-    # 7. Clamp negative z-scores (we only care about increases)
-    z_scores = np.maximum(z_scores, 0.0)
-
-    # 8. Spatial smoothing
-    z_scores = gaussian_filter(
-        z_scores.astype(np.float64),
-        sigma=[1.0, 1.5, 1.5],  # (z, y, x) in patches
-    ).astype(np.float32)
+    # Debug stats
+    if body_mask is not None and body_mask.any():
+        body_scores = z_scores[body_mask]
+        print(f"  z-scores (body only): min={body_scores.min():.2f}, "
+              f"max={body_scores.max():.2f}, mean={body_scores.mean():.2f}, "
+              f"p95={np.percentile(body_scores, 95):.2f}, "
+              f"p99={np.percentile(body_scores, 99):.2f}")
+        print(f"  body mask: {body_mask.sum()}/{body_mask.size} voxels "
+              f"({100*body_mask.mean():.1f}%)")
+    else:
+        print(f"  z-scores: min={z_scores.min():.2f}, max={z_scores.max():.2f}, "
+              f"mean={z_scores.mean():.2f}")
 
     return z_scores
 

@@ -120,8 +120,16 @@ def run_pipeline_job(job_id: str, ref_path: str, new_path: str, threshold: float
         del feat_ref_r, feat_new_r
 
         update(87, "Upsampling scores to native resolution...")
+        print(f"  Feature grid shape: {z_scores.shape}")
+        print(f"  Target (original) shape: {meta_new['original_shape']}")
         z_scores_full = upsample_scores(z_scores, meta_new["original_shape"])
         del z_scores
+
+        import numpy as _np
+        print(f"  Upsampled z-scores: min={z_scores_full.min():.2f}, "
+              f"max={z_scores_full.max():.2f}, "
+              f"above threshold ({threshold}): "
+              f"{(z_scores_full > threshold).sum()}/{z_scores_full.size} voxels")
 
         # Phase 5: Export
         update(90, "Generating DICOM SEG file...")
