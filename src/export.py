@@ -82,11 +82,11 @@ def create_dicom_seg(
 
     if not has_vigilance and not has_alert:
         # Fallback: use percentile-based thresholds
-        p90 = np.percentile(z_scores, 90)
-        p97 = np.percentile(z_scores, 97)
-        if p90 > 0.05:
-            mask_vigilance_only = z_scores > p90
-            mask_alert = z_scores > p97
+        p85 = np.percentile(z_scores, 85)
+        p95 = np.percentile(z_scores, 95)
+        if p85 > 0.01:
+            mask_vigilance_only = z_scores > p85
+            mask_alert = z_scores > p95
             mask_vigilance_only = mask_vigilance_only & ~mask_alert
             has_vigilance = mask_vigilance_only.any()
             has_alert = mask_alert.any()
