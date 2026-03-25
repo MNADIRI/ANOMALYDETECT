@@ -133,8 +133,9 @@ def create_dicom_seg(
         segments.append(seg_alert)
         masks.append(mask_alert)
 
-    # Stack masks: [n_segments, D, H, W] as boolean
-    pixel_array = np.stack(masks, axis=0).astype(np.uint8)
+    # highdicom 0.27 expects pixel_array shape [D, H, W, n_segments] for BINARY
+    # Stack masks along last dimension
+    pixel_array = np.stack(masks, axis=-1).astype(np.bool_)  # [D, H, W, n_seg]
 
     # Create the DICOM SEG
     seg = hd.seg.Segmentation(
@@ -152,7 +153,7 @@ def create_dicom_seg(
         device_serial_number="0001",
         series_description="AI Control Volume - Change Detection",
         content_description="Automated change detection between CT scans",
-        content_creator_name="CT Control Volume Pipeline",
+        content_creator_name="CT Control Volume^Pipeline",
     )
 
     seg.save_as(output_path)

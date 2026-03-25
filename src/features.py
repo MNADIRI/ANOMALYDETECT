@@ -71,6 +71,16 @@ class Mlp(nn.Module):
         return self.fc2(self.act(self.fc1(x)))
 
 
+class LayerScale(nn.Module):
+    """Per-channel learnable scaling (used in DINOv2)."""
+    def __init__(self, dim, init_value=1.0):
+        super().__init__()
+        self.gamma = nn.Parameter(init_value * torch.ones(dim))
+
+    def forward(self, x):
+        return x * self.gamma
+
+
 class Block(nn.Module):
     def __init__(self, dim, num_heads=12, mlp_ratio=4.0, qkv_bias=True):
         super().__init__()
@@ -78,8 +88,8 @@ class Block(nn.Module):
         self.attn = Attention(dim, num_heads=num_heads, qkv_bias=qkv_bias)
         self.norm2 = nn.LayerNorm(dim, eps=1e-6)
         self.mlp = Mlp(dim, hidden_features=int(dim * mlp_ratio))
-        self.ls1 = nn.Identity()
-        self.ls2 = nn.Identity()
+        self.ls1 = LayerScale(dim)
+        self.ls2 = LayerScale(dim)
 
     def forward(self, x):
         x = x + self.ls1(self.attn(self.norm1(x)))
@@ -112,12 +122,12 @@ class BlockWithSwiGLU(nn.Module):
         self.attn = Attention(dim, num_heads=num_heads, qkv_bias=qkv_bias)
         self.norm2 = nn.LayerNorm(dim, eps=1e-6)
         self.mlp = SwiGLUFFN(dim, hidden_features=int(dim * mlp_ratio))
-        self.ls1 = nn.Parameter(torch.ones(dim))
-        self.ls2 = nn.Parameter(torch.ones(dim))
+        self.ls1 = LayerScale(dim)
+        self.ls2 = LayerScale(dim)
 
     def forward(self, x):
-        x = x + self.ls1 * self.attn(self.norm1(x))
-        x = x + self.ls2 * self.mlp(self.norm2(x))
+        x = x + self.ls1(self.attn(self.norm1(x)))
+        x = x + self.ls2(self.mlp(self.norm2(x)))
         return x
 
 
