@@ -64,11 +64,24 @@ def ingest_dicom_folder(
     """
     # 1. Collect all DICOM files -------------------------------------------
     dcm_paths = []
+    skip_names = {"dicomdir", "dicomdir."}
     for root, _dirs, files in os.walk(dicom_dir):
         for fname in files:
+            # Skip DICOMDIR index files and hidden files
+            if fname.lower().rstrip(".") in skip_names:
+                continue
+            if fname.startswith("."):
+                continue
             fpath = os.path.join(root, fname)
             if fname.lower().endswith(".dcm") or "." not in fname:
                 dcm_paths.append(fpath)
+            else:
+                # Try to read any file — DICOM files don't always have .dcm extension
+                try:
+                    pydicom.dcmread(fpath, stop_before_pixels=True, force=True)
+                    dcm_paths.append(fpath)
+                except Exception:
+                    pass
 
     if not dcm_paths:
         raise ValueError(f"No DICOM files found in {dicom_dir}")
@@ -77,13 +90,23 @@ def ingest_dicom_folder(
     headers = []
     for p in dcm_paths:
         try:
-            ds = pydicom.dcmread(p, stop_before_pixels=True)
+            ds = pydicom.dcmread(p, stop_before_pixels=True, force=True)
+            # Skip files without pixel data indicators (DICOMDIR, SR, etc.)
+            has_rows = hasattr(ds, "Rows")
+            has_cols = hasattr(ds, "Columns")
+            if not (has_rows and has_cols):
+                continue
             headers.append((p, ds))
         except Exception:
             continue
 
     if not headers:
-        raise ValueError(f"No readable DICOM files in {dicom_dir}")
+        raise ValueError(
+            f"No readable DICOM image files in {dicom_dir}. "
+            f"Found {len(dcm_paths)} files but none contain image data. "
+            f"Make sure to provide the folder with the actual CT slices, "
+            f"not just the DICOMDIR file."
+        )
 
     # 3. Filter CT only, pick largest series -------------------------------
     ct_headers = [
@@ -91,7 +114,7 @@ def ingest_dicom_folder(
         if getattr(ds, "Modality", "").upper() == "CT"
     ]
     if not ct_headers:
-        # Fallback: use all files if no Modality tag
+        # Fallback: use all files with image data if no CT Modality tag
         ct_headers = headers
 
     series_counter = Counter(
