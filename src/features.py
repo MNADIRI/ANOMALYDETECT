@@ -1,8 +1,8 @@
 """
-Feature extraction using DINOv2 ViT-B14 (frozen, multi-layer).
+Feature extraction using DINOv2 ViT-B14 (frozen).
 
-Extracts intermediate patch-token activations from layers [2, 5, 8, 11],
-concatenates them, and optionally reduces dimensionality with PCA.
+Extracts patch-token activations from the last transformer block
+and CLS token embeddings for slice matching.
 """
 
 import math
@@ -12,7 +12,6 @@ from typing import Callable, Optional
 import numpy as np
 import torch
 import torch.nn as nn
-from sklearn.decomposition import PCA
 
 
 # ---------------------------------------------------------------------------
@@ -110,7 +109,6 @@ class SwiGLUFFN(nn.Module):
     def __init__(self, in_features, hidden_features=None):
         super().__init__()
         hidden_features = hidden_features or in_features * 4
-        # DINOv2 uses: (int(hidden * 2/3) + 7) // 8 * 8  (round to mult of 8)
         swiglu_hidden = (int(hidden_features * 2 / 3) + 7) // 8 * 8
         self.w12 = nn.Linear(in_features, 2 * swiglu_hidden)
         self.w3 = nn.Linear(swiglu_hidden, in_features)
@@ -122,7 +120,7 @@ class SwiGLUFFN(nn.Module):
 
 
 class BlockWithSwiGLU(nn.Module):
-    """Transformer block with SwiGLU FFN (used in DINOv2 reg4 models)."""
+    """Transformer block with SwiGLU FFN."""
     def __init__(self, dim, num_heads=12, mlp_ratio=4.0, qkv_bias=True, init_values=1e-5):
         super().__init__()
         self.norm1 = nn.LayerNorm(dim, eps=1e-6)
@@ -218,7 +216,6 @@ class DinoVisionTransformer(nn.Module):
 
 def _detect_checkpoint_type(state_dict: dict) -> tuple[bool, int]:
     """Detect if checkpoint uses SwiGLU and how many register tokens."""
-    # Check for SwiGLU by looking for mlp.w12 keys (NOT just 'w12' substring)
     has_swiglu = any(k.endswith(".mlp.w12.weight") for k in state_dict.keys())
     has_registers = "register_tokens" in state_dict
     n_reg = 0
@@ -234,9 +231,6 @@ def _detect_checkpoint_type(state_dict: dict) -> tuple[bool, int]:
 def load_model() -> tuple[nn.Module, torch.device, int, int]:
     """
     Load DINOv2 ViT-B14 and return (model, device, patch_size, n_register_tokens).
-
-    Loads from local checkpoint (weights/dinov2_vitb14.pth).
-    Falls back to torch.hub if checkpoint not found.
     """
     device = get_device()
     patch_size = 14
@@ -245,19 +239,16 @@ def load_model() -> tuple[nn.Module, torch.device, int, int]:
         os.path.dirname(os.path.dirname(__file__)), "weights", "dinov2_vitb14.pth"
     )
 
-    # Strategy 1: Load from local checkpoint (no internet needed)
     if os.path.exists(weight_path):
         print(f"Loading DINOv2 from local checkpoint: {weight_path}")
         state_dict = torch.load(weight_path, map_location="cpu", weights_only=True)
 
-        # Detect architecture from checkpoint keys
         use_swiglu, n_register = _detect_checkpoint_type(state_dict)
         print(f"  Detected: SwiGLU={use_swiglu}, register_tokens={n_register}")
 
-        # Debug: show key structure
+        # Debug key structure
         ckpt_keys = sorted(state_dict.keys())
-        print(f"  Checkpoint has {len(ckpt_keys)} keys")
-        # Show a few mlp keys to verify structure
+        print(f"  Checkpoint: {len(ckpt_keys)} keys")
         mlp_keys = [k for k in ckpt_keys if "blocks.0.mlp" in k]
         print(f"  blocks.0.mlp keys: {mlp_keys}")
 
@@ -271,51 +262,32 @@ def load_model() -> tuple[nn.Module, torch.device, int, int]:
             use_swiglu=use_swiglu,
         )
 
-        # Debug: show model keys
         model_keys = sorted(model.state_dict().keys())
-        print(f"  Model has {len(model_keys)} keys")
+        print(f"  Model: {len(model_keys)} keys")
         model_mlp_keys = [k for k in model_keys if "blocks.0.mlp" in k]
         print(f"  Model blocks.0.mlp keys: {model_mlp_keys}")
 
-        # Load weights (strict=False to handle mask_token which is unused in inference)
         missing, unexpected = model.load_state_dict(state_dict, strict=False)
+        missing_crit = [k for k in missing if "mask_token" not in k and "head" not in k]
+        unexpected_crit = [k for k in unexpected if "mask_token" not in k and "head" not in k]
 
-        # Filter out non-critical keys
-        missing_critical = [k for k in missing if "mask_token" not in k and "head" not in k]
-        unexpected_critical = [k for k in unexpected if "mask_token" not in k and "head" not in k]
-
-        if missing_critical:
-            print(f"  WARNING - MISSING keys ({len(missing_critical)}): {missing_critical[:10]}")
-        if unexpected_critical:
-            print(f"  WARNING - UNEXPECTED keys ({len(unexpected_critical)}): {unexpected_critical[:10]}")
-
-        if not missing_critical and not unexpected_critical:
+        if missing_crit:
+            print(f"  MISSING keys ({len(missing_crit)}): {missing_crit[:10]}")
+        if unexpected_crit:
+            print(f"  UNEXPECTED keys ({len(unexpected_crit)}): {unexpected_crit[:10]}")
+        if not missing_crit and not unexpected_crit:
             print("  All weights loaded successfully!")
-        elif missing_critical or unexpected_critical:
-            print("  Attempting key remapping...")
-            # Try to remap keys if there's a structural mismatch
-            state_dict_remapped = _remap_keys(state_dict, model)
-            if state_dict_remapped is not None:
-                missing2, unexpected2 = model.load_state_dict(state_dict_remapped, strict=False)
-                missing2_crit = [k for k in missing2 if "mask_token" not in k and "head" not in k]
-                unexpected2_crit = [k for k in unexpected2 if "mask_token" not in k and "head" not in k]
-                if len(missing2_crit) < len(missing_critical):
-                    print(f"  After remapping: {len(missing2_crit)} missing, {len(unexpected2_crit)} unexpected")
-                else:
-                    print("  Remapping did not help.")
 
         model = model.to(device)
         model.eval()
         print(f"  Model loaded on {device}")
         return model, device, patch_size, n_register
 
-    # Strategy 2: Try torch.hub (needs internet)
+    # Fallback: torch.hub
     print("Local checkpoint not found, trying torch.hub...")
     for hub_name, n_reg in [("dinov2_vitb14_reg", 4), ("dinov2_vitb14", 0)]:
         try:
-            model = torch.hub.load(
-                "facebookresearch/dinov2", hub_name, pretrained=True
-            )
+            model = torch.hub.load("facebookresearch/dinov2", hub_name, pretrained=True)
             n_register = getattr(model, "num_register_tokens", n_reg)
             patch_size = getattr(model, "patch_size", 14)
             model = model.to(device)
@@ -324,69 +296,14 @@ def load_model() -> tuple[nn.Module, torch.device, int, int]:
         except Exception:
             continue
 
-    raise RuntimeError(
-        "Could not load DINOv2. Run setup_model.py first to download "
-        "the checkpoint, or ensure internet access for torch.hub."
-    )
-
-
-def _remap_keys(state_dict: dict, model: nn.Module) -> dict | None:
-    """Try to remap checkpoint keys to match model structure."""
-    model_keys = set(model.state_dict().keys())
-    ckpt_keys = set(state_dict.keys())
-
-    # If they already mostly match, nothing to remap
-    matched = model_keys & ckpt_keys
-    if len(matched) > len(model_keys) * 0.9:
-        return None
-
-    # Common remapping: no prefix changes needed for DINOv2
-    # Just filter to only matching keys
-    remapped = {}
-    for k, v in state_dict.items():
-        if k in model_keys:
-            remapped[k] = v
-
-    if len(remapped) > len(matched):
-        return remapped
-    return None
+    raise RuntimeError("Could not load DINOv2. Run setup_model.py first.")
 
 
 # ---------------------------------------------------------------------------
-# Feature extractor with forward hooks
+# Feature extraction — single last layer (DINO-AD approach)
 # ---------------------------------------------------------------------------
 
-class MultiLayerFeatureExtractor:
-    """Register forward hooks on specified transformer blocks."""
-
-    def __init__(self, model: nn.Module, layer_indices: list[int]):
-        self.features: dict[int, torch.Tensor] = {}
-        self._hooks = []
-
-        blocks = model.blocks
-        for idx in layer_indices:
-            hook = blocks[idx].register_forward_hook(self._make_hook(idx))
-            self._hooks.append(hook)
-
-    def _make_hook(self, idx: int):
-        def hook_fn(_module, _input, output):
-            self.features[idx] = output
-        return hook_fn
-
-    def clear(self):
-        self.features.clear()
-
-    def remove_hooks(self):
-        for h in self._hooks:
-            h.remove()
-        self._hooks.clear()
-
-
-# ---------------------------------------------------------------------------
-# Feature extraction
-# ---------------------------------------------------------------------------
-
-EXTRACT_LAYERS = [2, 5, 8, 11]
+EXTRACT_LAYER = 11  # Last transformer block
 INPUT_SIZE = 512
 
 
@@ -397,28 +314,23 @@ def extract_features(
     device: torch.device,
     patch_size: int = 14,
     n_register: int = 4,
-    extract_layers: list[int] | None = None,
     progress_callback: Optional[Callable[[float], None]] = None,
-) -> np.ndarray:
+) -> tuple[np.ndarray, np.ndarray]:
     """
-    Extract multi-layer patch features for every slice in the volume.
+    Extract last-layer patch features and CLS token for every slice.
 
     Parameters
     ----------
     volume : [D, 3, H, W] float32, values in [0, 1]
-    patch_size : ViT patch size (14 for DINOv2)
-    n_register : number of register tokens to skip
 
     Returns
     -------
-    features : [D, Hp, Wp, C]  where C = len(extract_layers) * 768
+    patch_features : [D, Hp, Wp, 768]
+    cls_tokens : [D, 768] — for slice matching
     """
-    if extract_layers is None:
-        extract_layers = EXTRACT_LAYERS
-
     D, C, H, W = volume.shape
 
-    # Ensure H, W are multiples of patch_size by padding
+    # Pad to multiple of patch_size
     pad_h = (patch_size - H % patch_size) % patch_size
     pad_w = (patch_size - W % patch_size) % patch_size
     if pad_h or pad_w:
@@ -432,113 +344,93 @@ def extract_features(
 
     Hp = H // patch_size
     Wp = W // patch_size
-    embed_dim = 768  # ViT-B
-    feat_dim = len(extract_layers) * embed_dim
+    embed_dim = 768
 
-    # Precompute ImageNet normalization tensors on device
+    # Precompute normalization tensors on device
     img_mean = IMAGENET_MEAN.to(device)
     img_std = IMAGENET_STD.to(device)
 
-    extractor = MultiLayerFeatureExtractor(model, extract_layers)
-
-    all_features = np.empty((D, Hp, Wp, feat_dim), dtype=np.float32)
+    all_features = np.empty((D, Hp, Wp, embed_dim), dtype=np.float32)
+    all_cls = np.empty((D, embed_dim), dtype=np.float32)
 
     for i in range(D):
-        extractor.clear()
-
         # Prepare single-slice batch [1, 3, H, W]
         slice_tensor = torch.from_numpy(volume[i : i + 1]).to(device)
 
-        # *** CRITICAL: Apply ImageNet normalization ***
-        # DINOv2 expects inputs normalized with ImageNet mean/std
+        # ImageNet normalization
         slice_tensor = (slice_tensor - img_mean) / img_std
 
-        # Forward pass
-        _ = model(slice_tensor)
+        # Forward pass — get final output (after norm)
+        output = model(slice_tensor)  # [1, 1+n_reg+Hp*Wp, 768]
 
-        # Gather features from hooks
-        layer_feats = []
-        for layer_idx in extract_layers:
-            tokens = extractor.features[layer_idx]  # [1, L, 768]
-            # Remove CLS + register tokens
-            n_skip = 1 + n_register
-            patch_tokens = tokens[:, n_skip:, :]  # [1, Hp*Wp, 768]
+        # Extract CLS token (always first)
+        cls_token = output[:, 0, :]  # [1, 768]
+        all_cls[i] = cls_token.cpu().numpy()
 
-            # Verify count and auto-detect if needed
-            expected = Hp * Wp
-            actual = patch_tokens.shape[1]
-            if actual != expected:
-                n_skip_auto = tokens.shape[1] - expected
-                if n_skip_auto > 0:
-                    patch_tokens = tokens[:, n_skip_auto:, :]
-                else:
-                    # Tokens are fewer than expected — truncate grid
-                    patch_tokens = tokens[:, n_skip:, :]
-                    actual = patch_tokens.shape[1]
+        # Extract patch tokens (skip CLS + register tokens)
+        n_skip = 1 + n_register
+        patch_tokens = output[:, n_skip:, :]  # [1, Hp*Wp, 768]
 
-            patch_tokens = patch_tokens[:, :expected, :]  # safety truncation
-            patch_tokens = patch_tokens.reshape(1, Hp, Wp, embed_dim)
-            layer_feats.append(patch_tokens.cpu())
+        # Auto-detect if token count doesn't match
+        expected = Hp * Wp
+        if patch_tokens.shape[1] != expected:
+            n_skip_auto = output.shape[1] - expected
+            if n_skip_auto > 0:
+                patch_tokens = output[:, n_skip_auto:, :]
 
-        # Concatenate layers: [1, Hp, Wp, feat_dim]
-        combined = torch.cat(layer_feats, dim=-1)
-        all_features[i] = combined[0].numpy()
+        patch_tokens = patch_tokens[:, :expected, :]
+        patch_tokens = patch_tokens.reshape(1, Hp, Wp, embed_dim)
+        all_features[i] = patch_tokens[0].cpu().numpy()
 
         # Memory cleanup
-        del slice_tensor
+        del slice_tensor, output
         if hasattr(torch, "mps") and hasattr(torch.mps, "empty_cache"):
             torch.mps.empty_cache()
 
         if progress_callback is not None:
             progress_callback((i + 1) / D)
 
-    extractor.remove_hooks()
-    return all_features
+    return all_features, all_cls
 
 
-# ---------------------------------------------------------------------------
-# PCA dimensionality reduction
-# ---------------------------------------------------------------------------
-
-def reduce_features(
-    features_ref: np.ndarray,
-    features_new: np.ndarray,
-    n_components: int = 256,
-) -> tuple[np.ndarray, np.ndarray]:
+def match_slices(
+    cls_new: np.ndarray,
+    cls_ref: np.ndarray,
+    window: int = 5,
+) -> np.ndarray:
     """
-    Fit PCA on reference features, apply to both volumes.
+    For each new slice, find the best-matching reference slice
+    within a local window using CLS token cosine similarity.
 
     Parameters
     ----------
-    features_ref, features_new : [D, Hp, Wp, C]
+    cls_new : [D_new, 768]
+    cls_ref : [D_ref, 768]
+    window : search window (±window slices around positional match)
 
     Returns
     -------
-    ref_reduced, new_reduced : [D, Hp, Wp, n_components]
+    indices : [D_new] — index into reference for each new slice
     """
-    D, Hp, Wp, C = features_ref.shape
+    D_new = cls_new.shape[0]
+    D_ref = cls_ref.shape[0]
 
-    # Flatten to (N, C)
-    ref_flat = features_ref.reshape(-1, C)
-    new_flat = features_new.reshape(-1, C)
+    # L2-normalize
+    eps = 1e-8
+    new_norm = cls_new / (np.linalg.norm(cls_new, axis=-1, keepdims=True) + eps)
+    ref_norm = cls_ref / (np.linalg.norm(cls_ref, axis=-1, keepdims=True) + eps)
 
-    # Subsample for fitting PCA (max 50000 patches)
-    n_total = ref_flat.shape[0]
-    max_samples = 50_000
-    if n_total > max_samples:
-        rng = np.random.default_rng(42)
-        indices = rng.choice(n_total, max_samples, replace=False)
-        fit_data = ref_flat[indices]
-    else:
-        fit_data = ref_flat
+    indices = np.zeros(D_new, dtype=np.int64)
 
-    n_components = min(n_components, C, fit_data.shape[0])
-    pca = PCA(n_components=n_components, whiten=True, random_state=42)
-    pca.fit(fit_data)
+    for i in range(D_new):
+        # Positional match
+        pos_match = int(i * D_ref / D_new)
+        start = max(0, pos_match - window)
+        end = min(D_ref, pos_match + window + 1)
 
-    ref_reduced = pca.transform(ref_flat).reshape(D, Hp, Wp, n_components)
-    new_reduced = pca.transform(new_flat).reshape(
-        features_new.shape[0], Hp, Wp, n_components
-    )
+        # Cosine similarity with candidates
+        sims = ref_norm[start:end] @ new_norm[i]
+        best_local = np.argmax(sims)
+        indices[i] = start + best_local
 
-    return ref_reduced.astype(np.float32), new_reduced.astype(np.float32)
+    return indices

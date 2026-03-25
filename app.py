@@ -23,7 +23,7 @@ from src.registration import (
     register_to_reference,
     apply_transform_to_multichannel,
 )
-from src.features import load_model, extract_features, reduce_features
+from src.features import load_model, extract_features, match_slices
 from src.scoring import compute_change_scores, upsample_scores
 from src.export import create_dicom_seg
 
@@ -80,7 +80,7 @@ def run_pipeline_job(job_id: str, ref_path: str, new_path: str, threshold: float
         model, device, patch_size, n_register = load_model()
 
         update(40, "Extracting features - reference...")
-        feat_ref = extract_features(
+        feat_ref, cls_ref = extract_features(
             model, vol_ref_3ch_reg, device,
             patch_size=patch_size,
             n_register=n_register,
@@ -90,7 +90,7 @@ def run_pipeline_job(job_id: str, ref_path: str, new_path: str, threshold: float
         )
 
         update(60, "Extracting features - new scan...")
-        feat_new = extract_features(
+        feat_new, cls_new = extract_features(
             model, vol_new_3ch, device,
             patch_size=patch_size,
             n_register=n_register,
@@ -105,29 +105,30 @@ def run_pipeline_job(job_id: str, ref_path: str, new_path: str, threshold: float
         if hasattr(torch, "mps") and hasattr(torch.mps, "empty_cache"):
             torch.mps.empty_cache()
 
-        # PCA
-        update(78, "Dimensionality reduction (PCA)...")
-        feat_ref_r, feat_new_r = reduce_features(feat_ref, feat_new)
-        del feat_ref, feat_new
+        # Slice matching: best reference slice per new slice
+        update(78, "Matching slices (CLS token similarity)...")
+        matched_indices = match_slices(cls_new, cls_ref, window=5)
+        print(f"  Slice matching: {len(matched_indices)} slices matched")
+        feat_ref_matched = feat_ref[matched_indices]
+        del feat_ref, cls_ref, cls_new
 
-        # Phase 4: Scoring
-        update(82, "Computing anomaly scores...")
-        z_scores = compute_change_scores(
-            feat_new_r, feat_ref_r,
+        # Phase 4: Scoring (DINO-AD: K-means + cosine similarity)
+        update(82, "Computing anomaly scores (K-means + cosine)...")
+        anomaly_scores = compute_change_scores(
+            feat_new, feat_ref_matched,
             volume_hu_new=vol_new_hu,
             patch_size=patch_size,
         )
-        del feat_ref_r, feat_new_r
+        del feat_ref_matched, feat_new
 
         update(87, "Upsampling scores to native resolution...")
-        print(f"  Feature grid shape: {z_scores.shape}")
-        print(f"  Target (original) shape: {meta_new['original_shape']}")
-        z_scores_full = upsample_scores(z_scores, meta_new["original_shape"])
-        del z_scores
+        print(f"  Anomaly grid: {anomaly_scores.shape}")
+        print(f"  Target shape: {meta_new['original_shape']}")
+        z_scores_full = upsample_scores(anomaly_scores, meta_new["original_shape"])
+        del anomaly_scores
 
-        import numpy as _np
-        print(f"  Upsampled z-scores: min={z_scores_full.min():.2f}, "
-              f"max={z_scores_full.max():.2f}, "
+        print(f"  Upsampled scores: min={z_scores_full.min():.3f}, "
+              f"max={z_scores_full.max():.3f}, "
               f"above threshold ({threshold}): "
               f"{(z_scores_full > threshold).sum()}/{z_scores_full.size} voxels")
 
