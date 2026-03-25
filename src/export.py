@@ -99,9 +99,10 @@ def create_dicom_seg(
             segmented_property_category=codes.SCT.MorphologicallyAbnormalStructure,
             segmented_property_type=codes.SCT.Neoplasm,
             algorithm_type=hd.seg.SegmentAlgorithmTypeValues.AUTOMATIC,
-            algorithm_identification=hd.AlgorithmIdentification(
+            algorithm_identification=hd.AlgorithmIdentificationSequence(
                 name="CT Control Volume",
                 version="1.0",
+                family=codes.cid7162.ArtificialIntelligence,
             ),
             tracking_uid=generate_uid(),
             tracking_id="vigilance_zone",
@@ -121,9 +122,10 @@ def create_dicom_seg(
             segmented_property_category=codes.SCT.MorphologicallyAbnormalStructure,
             segmented_property_type=codes.SCT.Neoplasm,
             algorithm_type=hd.seg.SegmentAlgorithmTypeValues.AUTOMATIC,
-            algorithm_identification=hd.AlgorithmIdentification(
+            algorithm_identification=hd.AlgorithmIdentificationSequence(
                 name="CT Control Volume",
                 version="1.0",
+                family=codes.cid7162.ArtificialIntelligence,
             ),
             tracking_uid=generate_uid(),
             tracking_id="alert_zone",
