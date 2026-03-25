@@ -112,7 +112,11 @@ def run_pipeline_job(job_id: str, ref_path: str, new_path: str, threshold: float
 
         # Phase 4: Scoring
         update(82, "Computing anomaly scores...")
-        z_scores = compute_change_scores(feat_new_r, feat_ref_r)
+        z_scores = compute_change_scores(
+            feat_new_r, feat_ref_r,
+            volume_hu_new=vol_new_hu,
+            patch_size=patch_size,
+        )
         del feat_ref_r, feat_new_r
 
         update(87, "Upsampling scores to native resolution...")
