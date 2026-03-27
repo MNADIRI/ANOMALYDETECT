@@ -24,7 +24,7 @@ from src.registration import (
     apply_transform_to_multichannel,
 )
 from src.features import load_model, extract_features, match_slices
-from src.scoring import compute_change_scores, upsample_scores
+from src.scoring import fit_and_apply_pca, compute_change_scores, upsample_scores
 from src.export import create_dicom_seg
 
 app = FastAPI(title="CT Control Volume")
@@ -112,24 +112,32 @@ def run_pipeline_job(job_id: str, ref_path: str, new_path: str, threshold: float
         feat_ref_matched = feat_ref[matched_indices]
         del feat_ref, cls_ref, cls_new
 
-        # Phase 4: Scoring (DINO-AD: K-means + cosine similarity)
-        update(82, "Computing anomaly scores (K-means + cosine)...")
-        anomaly_scores = compute_change_scores(
-            feat_new, feat_ref_matched,
-            volume_hu_new=vol_new_hu,
-            patch_size=patch_size,
+        # Phase 4a: PCA whitening (fitted on reference)
+        update(80, "PCA whitening (n=64, fitted on reference)...")
+        feat_ref_pca, feat_new_pca = fit_and_apply_pca(
+            feat_ref_matched, feat_new,
+            n_components=64,
         )
         del feat_ref_matched, feat_new
 
-        update(87, "Upsampling scores to native resolution...")
-        print(f"  Anomaly grid: {anomaly_scores.shape}")
-        print(f"  Target shape: {meta_new['original_shape']}")
-        z_scores_full = upsample_scores(anomaly_scores, meta_new["original_shape"])
-        del anomaly_scores
+        # Phase 4b: Scoring (direct cosine + 3x3 tolerance + z-score)
+        update(84, "Computing change scores (cosine distance + z-score)...")
+        z_scores = compute_change_scores(
+            feat_new_pca, feat_ref_pca,
+            volume_hu_new=vol_new_hu,
+            patch_size=patch_size,
+        )
+        del feat_ref_pca, feat_new_pca
 
-        print(f"  Upsampled scores: min={z_scores_full.min():.3f}, "
-              f"max={z_scores_full.max():.3f}, "
-              f"above threshold ({threshold}): "
+        update(87, "Upsampling scores to native resolution...")
+        print(f"  Score grid: {z_scores.shape}")
+        print(f"  Target shape: {meta_new['original_shape']}")
+        z_scores_full = upsample_scores(z_scores, meta_new["original_shape"])
+        del z_scores
+
+        print(f"  Upsampled z-scores: min={z_scores_full.min():.2f}, "
+              f"max={z_scores_full.max():.2f}, "
+              f"above z>{threshold}: "
               f"{(z_scores_full > threshold).sum()}/{z_scores_full.size} voxels")
 
         # Phase 5: Export

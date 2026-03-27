@@ -7,6 +7,43 @@ import numpy as np
 import SimpleITK as sitk
 
 
+def _metadata_matches(meta_a: dict, meta_b: dict) -> bool:
+    """Check if two scans have identical spatial metadata (same acquisition)."""
+    # Same SeriesInstanceUID → definitely same scan
+    if (meta_a.get("series_uid") and meta_b.get("series_uid")
+            and meta_a["series_uid"] == meta_b["series_uid"]):
+        return True
+
+    # Check spacing, origin, direction within tolerance
+    try:
+        sp_a = np.array(meta_a["spacing"], dtype=np.float64)
+        sp_b = np.array(meta_b["spacing"], dtype=np.float64)
+        or_a = np.array(meta_a["original_origin"], dtype=np.float64)
+        or_b = np.array(meta_b["original_origin"], dtype=np.float64)
+        di_a = np.array(meta_a["original_direction"], dtype=np.float64)
+        di_b = np.array(meta_b["original_direction"], dtype=np.float64)
+
+        if (np.allclose(sp_a, sp_b, atol=0.01)
+                and np.allclose(or_a, or_b, atol=0.1)
+                and np.allclose(di_a, di_b, atol=1e-4)):
+            return True
+    except (KeyError, TypeError):
+        pass
+
+    return False
+
+
+def _match_dimensions(volume: np.ndarray, target_shape: tuple) -> np.ndarray:
+    """Crop or pad a volume to match target shape (no resampling)."""
+    result = np.full(target_shape, -1024.0, dtype=np.float32)
+    # Copy overlapping region
+    d = min(volume.shape[0], target_shape[0])
+    h = min(volume.shape[1], target_shape[1])
+    w = min(volume.shape[2], target_shape[2])
+    result[:d, :h, :w] = volume[:d, :h, :w]
+    return result
+
+
 def _numpy_to_sitk(
     volume: np.ndarray,
     spacing: tuple,
@@ -50,6 +87,14 @@ def register_to_reference(
             fixed_hu, fixed_meta["spacing"],
             fixed_meta["original_origin"], fixed_meta["original_direction"],
         )
+
+    # --- Bypass: skip registration if metadata is identical ---
+    if _metadata_matches(fixed_meta, moving_meta):
+        print("  Registration BYPASS: identical spatial metadata detected")
+        # Crop or pad moving volume to match fixed dimensions
+        registered_hu = _match_dimensions(moving_hu, fixed_hu.shape)
+        identity = sitk.Euler3DTransform()
+        return registered_hu, identity, fixed_image
 
     moving_image = moving_meta.get("sitk_reference")
     if moving_image is None:
@@ -126,6 +171,23 @@ def apply_transform_to_multichannel(
     registered_3ch : [D, 3, H, W] float32
     """
     D, C, H, W = moving_3ch.shape
+
+    # If identity transform (bypass), just match dimensions
+    if isinstance(transform, sitk.Euler3DTransform):
+        params = transform.GetParameters()
+        if all(p == 0.0 for p in params):
+            print("  Multichannel transform BYPASS: identity transform")
+            ref_size = reference_image.GetSize()  # (W, H, D) in sitk ordering
+            target_d = ref_size[2]
+            target_h = ref_size[1]
+            target_w = ref_size[0]
+            result = np.zeros((target_d, C, target_h, target_w), dtype=np.float32)
+            d = min(D, target_d)
+            h = min(H, target_h)
+            w = min(W, target_w)
+            result[:d, :, :h, :w] = moving_3ch[:d, :, :h, :w]
+            return result
+
     registered_channels = []
 
     for c in range(C):

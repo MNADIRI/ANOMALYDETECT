@@ -1,8 +1,8 @@
 """
 Feature extraction using DINOv2 ViT-B14 (frozen).
 
-Extracts patch-token activations from the last transformer block
-and CLS token embeddings for slice matching.
+Multi-layer extraction (blocks 3, 7, 11) with L2-norm averaging
+(SubspaceAD approach) and CLS token for slice matching.
 """
 
 import math
@@ -246,7 +246,6 @@ def load_model() -> tuple[nn.Module, torch.device, int, int]:
         use_swiglu, n_register = _detect_checkpoint_type(state_dict)
         print(f"  Detected: SwiGLU={use_swiglu}, register_tokens={n_register}")
 
-        # Debug key structure
         ckpt_keys = sorted(state_dict.keys())
         print(f"  Checkpoint: {len(ckpt_keys)} keys")
         mlp_keys = [k for k in ckpt_keys if "blocks.0.mlp" in k]
@@ -300,11 +299,35 @@ def load_model() -> tuple[nn.Module, torch.device, int, int]:
 
 
 # ---------------------------------------------------------------------------
-# Feature extraction — single last layer (DINO-AD approach)
+# Multi-layer feature extraction (SubspaceAD: blocks 3, 7, 11)
 # ---------------------------------------------------------------------------
 
-EXTRACT_LAYER = 11  # Last transformer block
+EXTRACT_LAYERS = [3, 7, 11]  # 0-indexed block indices
 INPUT_SIZE = 512
+
+
+class _MultiLayerHookExtractor:
+    """Register forward hooks on specified transformer blocks."""
+
+    def __init__(self, model: nn.Module, layer_indices: list[int]):
+        self.features: dict[int, torch.Tensor] = {}
+        self._hooks = []
+        for idx in layer_indices:
+            hook = model.blocks[idx].register_forward_hook(self._make_hook(idx))
+            self._hooks.append(hook)
+
+    def _make_hook(self, idx: int):
+        def hook_fn(_module, _input, output):
+            self.features[idx] = output
+        return hook_fn
+
+    def clear(self):
+        self.features.clear()
+
+    def remove(self):
+        for h in self._hooks:
+            h.remove()
+        self._hooks.clear()
 
 
 @torch.no_grad()
@@ -317,7 +340,11 @@ def extract_features(
     progress_callback: Optional[Callable[[float], None]] = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
-    Extract last-layer patch features and CLS token for every slice.
+    Extract multi-layer averaged patch features and CLS token for every slice.
+
+    Uses forward hooks on blocks 3, 7, 11. For each layer, patch tokens are
+    L2-normalized independently, then averaged across layers, then L2-normalized
+    again (SubspaceAD approach).
 
     Parameters
     ----------
@@ -326,7 +353,7 @@ def extract_features(
     Returns
     -------
     patch_features : [D, Hp, Wp, 768]
-    cls_tokens : [D, 768] — for slice matching
+    cls_tokens : [D, 768] — from final output (post-norm), for slice matching
     """
     D, C, H, W = volume.shape
 
@@ -345,51 +372,63 @@ def extract_features(
     Hp = H // patch_size
     Wp = W // patch_size
     embed_dim = 768
+    expected = Hp * Wp
+    n_skip = 1 + n_register  # CLS + register tokens to skip
 
     # Precompute normalization tensors on device
     img_mean = IMAGENET_MEAN.to(device)
     img_std = IMAGENET_STD.to(device)
 
+    # Register hooks on target blocks
+    extractor = _MultiLayerHookExtractor(model, EXTRACT_LAYERS)
+
     all_features = np.empty((D, Hp, Wp, embed_dim), dtype=np.float32)
     all_cls = np.empty((D, embed_dim), dtype=np.float32)
 
     for i in range(D):
-        # Prepare single-slice batch [1, 3, H, W]
         slice_tensor = torch.from_numpy(volume[i : i + 1]).to(device)
-
-        # ImageNet normalization
         slice_tensor = (slice_tensor - img_mean) / img_std
 
-        # Forward pass — get final output (after norm)
+        # Forward pass — hooks capture intermediate block outputs
         output = model(slice_tensor)  # [1, 1+n_reg+Hp*Wp, 768]
 
-        # Extract CLS token (always first)
-        cls_token = output[:, 0, :]  # [1, 768]
-        all_cls[i] = cls_token.cpu().numpy()
+        # CLS token from final output (post model.norm)
+        all_cls[i] = output[:, 0, :].cpu().numpy()
 
-        # Extract patch tokens (skip CLS + register tokens)
-        n_skip = 1 + n_register
-        patch_tokens = output[:, n_skip:, :]  # [1, Hp*Wp, 768]
+        # Extract and average patch tokens from hooked layers
+        layer_features = []
+        for layer_idx in EXTRACT_LAYERS:
+            block_out = extractor.features[layer_idx]  # [1, 1+n_reg+n_patches, 768]
 
-        # Auto-detect if token count doesn't match
-        expected = Hp * Wp
-        if patch_tokens.shape[1] != expected:
-            n_skip_auto = output.shape[1] - expected
-            if n_skip_auto > 0:
-                patch_tokens = output[:, n_skip_auto:, :]
+            # Extract patch tokens (skip CLS + register)
+            patches = block_out[:, n_skip:, :]
+            if patches.shape[1] != expected:
+                n_skip_auto = block_out.shape[1] - expected
+                if n_skip_auto > 0:
+                    patches = block_out[:, n_skip_auto:, :]
+            patches = patches[:, :expected, :]
+            patches = patches.reshape(1, Hp, Wp, embed_dim)
 
-        patch_tokens = patch_tokens[:, :expected, :]
-        patch_tokens = patch_tokens.reshape(1, Hp, Wp, embed_dim)
-        all_features[i] = patch_tokens[0].cpu().numpy()
+            # L2-normalize per patch vector (dim=-1)
+            patches = nn.functional.normalize(patches, dim=-1)
+            layer_features.append(patches)
 
-        # Memory cleanup
-        del slice_tensor, output
+        # Average across layers, then L2-normalize again
+        averaged = torch.stack(layer_features, dim=0).mean(dim=0)  # [1, Hp, Wp, 768]
+        averaged = nn.functional.normalize(averaged, dim=-1)
+
+        all_features[i] = averaged[0].cpu().numpy()
+
+        # Clear hook storage and GPU memory
+        extractor.clear()
+        del slice_tensor, output, averaged, layer_features
         if hasattr(torch, "mps") and hasattr(torch.mps, "empty_cache"):
             torch.mps.empty_cache()
 
         if progress_callback is not None:
             progress_callback((i + 1) / D)
 
+    extractor.remove()
     return all_features, all_cls
 
 
@@ -406,7 +445,7 @@ def match_slices(
     ----------
     cls_new : [D_new, 768]
     cls_ref : [D_ref, 768]
-    window : search window (±window slices around positional match)
+    window : search window (+-window slices around positional match)
 
     Returns
     -------
@@ -415,7 +454,6 @@ def match_slices(
     D_new = cls_new.shape[0]
     D_ref = cls_ref.shape[0]
 
-    # L2-normalize
     eps = 1e-8
     new_norm = cls_new / (np.linalg.norm(cls_new, axis=-1, keepdims=True) + eps)
     ref_norm = cls_ref / (np.linalg.norm(cls_ref, axis=-1, keepdims=True) + eps)
@@ -423,12 +461,10 @@ def match_slices(
     indices = np.zeros(D_new, dtype=np.int64)
 
     for i in range(D_new):
-        # Positional match
         pos_match = int(i * D_ref / D_new)
         start = max(0, pos_match - window)
         end = min(D_ref, pos_match + window + 1)
 
-        # Cosine similarity with candidates
         sims = ref_norm[start:end] @ new_norm[i]
         best_local = np.argmax(sims)
         indices[i] = start + best_local

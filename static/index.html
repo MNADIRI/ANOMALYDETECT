@@ -323,10 +323,10 @@
 
   <!-- Threshold -->
   <div class="section threshold-section">
-    <label>Sensitivity threshold</label>
+    <label>Z-score threshold</label>
     <div class="threshold-row">
-      <input type="range" id="threshold" min="0.1" max="0.9" step="0.05" value="0.5">
-      <span class="threshold-value" id="threshold-val">0.50</span>
+      <input type="range" id="threshold" min="1.5" max="6" step="0.5" value="3.0">
+      <span class="threshold-value" id="threshold-val">3.0</span>
     </div>
   </div>
 
@@ -365,11 +365,11 @@
     <div class="legend">
       <div class="legend-item">
         <div class="legend-color" style="background: var(--yellow)"></div>
-        <span>Vigilance (score &gt; threshold)</span>
+        <span>Vigilance (z &gt; threshold)</span>
       </div>
       <div class="legend-item">
         <div class="legend-color" style="background: var(--red)"></div>
-        <span>Alert (score &gt; threshold + 0.2)</span>
+        <span>Alert (z &gt; threshold &times; 1.5)</span>
       </div>
     </div>
   </div>
@@ -390,7 +390,7 @@
   const thresholdInput = document.getElementById('threshold');
   const thresholdVal = document.getElementById('threshold-val');
   thresholdInput.addEventListener('input', () => {
-    thresholdVal.textContent = parseFloat(thresholdInput.value).toFixed(2);
+    thresholdVal.textContent = parseFloat(thresholdInput.value).toFixed(1);
   });
 
   let currentJobId = null;
