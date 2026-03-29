@@ -24,7 +24,7 @@ from src.registration import (
     apply_transform_to_multichannel,
 )
 from src.features import load_model, extract_features, match_slices
-from src.scoring import fit_and_apply_pca, compute_change_scores, upsample_scores
+from src.scoring import fit_pca, compute_change_scores, upsample_scores
 from src.export import create_dicom_seg
 
 app = FastAPI(title="CT Control Volume")
@@ -60,9 +60,11 @@ def run_pipeline_job(job_id: str, ref_path: str, new_path: str, threshold: float
         update(5, "Reading reference scan...")
         vol_ref_3ch, vol_ref_hu, meta_ref = ingest_dicom_folder(ref_path)
 
-        # Phase 1b: Ingest new scan
+        # Phase 1b: Ingest new scan (use same body region as reference)
         update(15, "Reading new scan...")
-        vol_new_3ch, vol_new_hu, meta_new = ingest_dicom_folder(new_path)
+        vol_new_3ch, vol_new_hu, meta_new = ingest_dicom_folder(
+            new_path, body_region=meta_ref.get("body_region"),
+        )
 
         # Phase 2: Registration
         update(25, "Spatial registration...")
@@ -112,22 +114,19 @@ def run_pipeline_job(job_id: str, ref_path: str, new_path: str, threshold: float
         feat_ref_matched = feat_ref[matched_indices]
         del feat_ref, cls_ref, cls_new
 
-        # Phase 4a: PCA whitening (fitted on reference)
-        update(80, "PCA whitening (n=64, fitted on reference)...")
-        feat_ref_pca, feat_new_pca = fit_and_apply_pca(
-            feat_ref_matched, feat_new,
-            n_components=64,
-        )
-        del feat_ref_matched, feat_new
+        # Phase 4a: PCA fitting (on reference features)
+        update(80, "Fitting PCA on reference subspace (n=64)...")
+        pca_model = fit_pca(feat_ref_matched, n_components=64)
 
-        # Phase 4b: Scoring (direct cosine + 3x3 tolerance + z-score)
-        update(84, "Computing change scores (cosine distance + z-score)...")
+        # Phase 4b: Scoring (PCA reconstruction error + z-score)
+        update(84, "Computing change scores (reconstruction error + z-score)...")
         z_scores = compute_change_scores(
-            feat_new_pca, feat_ref_pca,
+            feat_new, feat_ref_matched,
+            pca=pca_model,
             volume_hu_new=vol_new_hu,
             patch_size=patch_size,
         )
-        del feat_ref_pca, feat_new_pca
+        del feat_ref_matched, feat_new, pca_model
 
         update(87, "Upsampling scores to native resolution...")
         print(f"  Score grid: {z_scores.shape}")
