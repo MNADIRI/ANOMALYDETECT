@@ -69,7 +69,7 @@ def fit_and_apply_pca(
 
 
 # ---------------------------------------------------------------------------
-# Simple foreground mask — vectorized mean HU per patch
+# Foreground mask — explicit block-mean HU computation
 # ---------------------------------------------------------------------------
 
 def _create_foreground_mask(
@@ -79,6 +79,9 @@ def _create_foreground_mask(
 ) -> np.ndarray:
     """
     Create foreground mask by computing mean HU per patch region.
+
+    Maps each feature grid cell to a block of voxels in the HU volume
+    and computes the mean HU. Foreground = mean HU > threshold.
 
     Parameters
     ----------
@@ -93,14 +96,24 @@ def _create_foreground_mask(
     D_feat, Hp, Wp = grid_shape
     D_hu, H_hu, W_hu = volume_hu.shape
 
-    # Use zoom to downsample HU volume to grid resolution, then threshold
-    factors = (D_feat / D_hu, Hp / H_hu, Wp / W_hu)
-    mean_hu = zoom(volume_hu, factors, order=1)
+    slice_ratio = D_hu / D_feat
+    patch_h = H_hu / Hp
+    patch_w = W_hu / Wp
 
-    # Ensure shape matches exactly
-    mean_hu = mean_hu[:D_feat, :Hp, :Wp]
+    mask = np.zeros((D_feat, Hp, Wp), dtype=bool)
 
-    return mean_hu > hu_threshold
+    for d in range(D_feat):
+        d_start = int(d * slice_ratio)
+        d_end = max(d_start + 1, min(int((d + 1) * slice_ratio), D_hu))
+        for i in range(Hp):
+            h_s = int(i * patch_h)
+            h_e = max(h_s + 1, min(int((i + 1) * patch_h), H_hu))
+            for j in range(Wp):
+                w_s = int(j * patch_w)
+                w_e = max(w_s + 1, min(int((j + 1) * patch_w), W_hu))
+                mask[d, i, j] = volume_hu[d_start:d_end, h_s:h_e, w_s:w_e].mean() > hu_threshold
+
+    return mask
 
 
 # ---------------------------------------------------------------------------
@@ -135,25 +148,19 @@ def compute_change_scores(
     new_norm = features_new / (np.linalg.norm(features_new, axis=-1, keepdims=True) + eps)
     ref_norm = features_ref / (np.linalg.norm(features_ref, axis=-1, keepdims=True) + eps)
 
-    # 2. Cosine distance with 3x3 spatial tolerance
-    #    For each patch (d, i, j), find the most similar patch in ref within i±1, j±1
-    distances = np.zeros((D, Hp, Wp), dtype=np.float32)
+    # 2. Cosine distance with 3x3 spatial tolerance (vectorized)
+    #    Pad reference, compute similarity for all 9 neighbor offsets, take max
+    ref_padded = np.pad(ref_norm, ((0, 0), (1, 1), (1, 1), (0, 0)), mode='edge')
 
-    for d in range(D):
-        for i in range(Hp):
-            i_lo = max(0, i - 1)
-            i_hi = min(Hp, i + 2)
-            for j in range(Wp):
-                j_lo = max(0, j - 1)
-                j_hi = min(Wp, j + 2)
+    best_sim = np.full((D, Hp, Wp), -1.0, dtype=np.float32)
+    for di in range(3):
+        for dj in range(3):
+            candidate = ref_padded[:, di:di + Hp, dj:dj + Wp, :]  # [D, Hp, Wp, C]
+            sim = np.sum(new_norm * candidate, axis=-1)  # [D, Hp, Wp]
+            best_sim = np.maximum(best_sim, sim)
 
-                # Query vector
-                q = new_norm[d, i, j]  # [C]
-                # Candidate neighborhood in reference
-                candidates = ref_norm[d, i_lo:i_hi, j_lo:j_hi]  # [<=3, <=3, C]
-                # Cosine similarities
-                sims = candidates.reshape(-1, C) @ q  # [<=9]
-                distances[d, i, j] = 1.0 - sims.max()
+    distances = 1.0 - best_sim  # [D, Hp, Wp], range [0, 2]
+    distances = np.maximum(distances, 0.0)
 
     # 3. Foreground mask
     fg_mask = None
@@ -161,7 +168,7 @@ def compute_change_scores(
         fg_mask = _create_foreground_mask(volume_hu_new, (D, Hp, Wp))
         n_fg = fg_mask.sum()
         print(f"  Foreground mask: {n_fg}/{fg_mask.size} patches "
-              f"({100*n_fg/fg_mask.size:.1f}%)")
+              f"({100 * n_fg / fg_mask.size:.1f}%)")
 
     # 4. Z-score normalization (median + MAD) on foreground
     if fg_mask is not None and fg_mask.any():
@@ -171,9 +178,9 @@ def compute_change_scores(
 
     median = np.median(fg_dists)
     mad = np.median(np.abs(fg_dists - median))
-    mad = max(mad, 0.01)  # floor to avoid division by zero
+    mad = max(mad, 1e-6)  # minimal floor — only prevent division by zero
 
-    z_scores = (distances - median) / (1.4826 * mad)  # 1.4826 = MAD-to-std scaling
+    z_scores = (distances - median) / (1.4826 * mad)
     z_scores = np.maximum(z_scores, 0.0)  # only positive z-scores
 
     # 5. Gaussian smoothing
@@ -189,7 +196,7 @@ def compute_change_scores(
     # Debug stats
     if fg_mask is not None and fg_mask.any():
         fg_z = z_scores[fg_mask]
-        print(f"  Z-scores (fg): median_dist={median:.4f}, MAD={mad:.4f}")
+        print(f"  Z-scores (fg): median_dist={median:.6f}, MAD={mad:.6f}")
         print(f"  Z-scores (fg): min={fg_z.min():.2f}, max={fg_z.max():.2f}, "
               f"mean={fg_z.mean():.2f}, "
               f"p95={np.percentile(fg_z, 95):.2f}, "

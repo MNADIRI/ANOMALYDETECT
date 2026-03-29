@@ -8,29 +8,10 @@ import SimpleITK as sitk
 
 
 def _metadata_matches(meta_a: dict, meta_b: dict) -> bool:
-    """Check if two scans have identical spatial metadata (same acquisition)."""
-    # Same SeriesInstanceUID → definitely same scan
-    if (meta_a.get("series_uid") and meta_b.get("series_uid")
-            and meta_a["series_uid"] == meta_b["series_uid"]):
-        return True
-
-    # Check spacing, origin, direction within tolerance
-    try:
-        sp_a = np.array(meta_a["spacing"], dtype=np.float64)
-        sp_b = np.array(meta_b["spacing"], dtype=np.float64)
-        or_a = np.array(meta_a["original_origin"], dtype=np.float64)
-        or_b = np.array(meta_b["original_origin"], dtype=np.float64)
-        di_a = np.array(meta_a["original_direction"], dtype=np.float64)
-        di_b = np.array(meta_b["original_direction"], dtype=np.float64)
-
-        if (np.allclose(sp_a, sp_b, atol=0.01)
-                and np.allclose(or_a, or_b, atol=0.1)
-                and np.allclose(di_a, di_b, atol=1e-4)):
-            return True
-    except (KeyError, TypeError):
-        pass
-
-    return False
+    """Check if two scans are the same acquisition (same SeriesInstanceUID)."""
+    uid_a = meta_a.get("series_uid")
+    uid_b = meta_b.get("series_uid")
+    return bool(uid_a and uid_b and uid_a == uid_b)
 
 
 def _match_dimensions(volume: np.ndarray, target_shape: tuple) -> np.ndarray:
