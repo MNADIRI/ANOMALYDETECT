@@ -48,11 +48,11 @@ def fit_pca(
         ref_sample = ref_flat
 
     # Fit PCA with whitening on reference
-    pca = PCA(n_components=n_components, whiten=True, random_state=42)
+    pca = PCA(n_components=n_components, whiten=False, random_state=42)
     pca.fit(ref_sample)
 
     variance_explained = pca.explained_variance_ratio_.sum()
-    print(f"  PCA: {n_components} components, whiten=True, "
+    print(f"  PCA: {n_components} components, whiten=False, "
           f"variance explained: {variance_explained:.1%}")
 
     return pca

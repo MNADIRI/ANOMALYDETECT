@@ -409,13 +409,10 @@ def extract_features(
             patches = patches[:, :expected, :]
             patches = patches.reshape(1, Hp, Wp, embed_dim)
 
-            # L2-normalize per patch vector (dim=-1)
-            patches = nn.functional.normalize(patches, dim=-1)
             layer_features.append(patches)
 
-        # Average across layers, then L2-normalize again
+        # Average across layers (raw features — no L2 normalization to preserve magnitude)
         averaged = torch.stack(layer_features, dim=0).mean(dim=0)  # [1, Hp, Wp, 768]
-        averaged = nn.functional.normalize(averaged, dim=-1)
 
         all_features[i] = averaged[0].cpu().numpy()
 
