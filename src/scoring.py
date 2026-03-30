@@ -52,8 +52,9 @@ def _create_foreground_mask(
 # Scoring: PatchCore-style memory bank nearest neighbor
 # ---------------------------------------------------------------------------
 
-MAX_BANK_SIZE = 15_000  # subsample reference bank for speed
+MAX_BANK_SIZE = 60_000  # use all foreground patches (no subsampling)
 CHUNK_SIZE = 500        # process new patches in chunks to limit memory
+EDGE_SLICES = 5         # trim first/last N slices (different scan coverage)
 
 
 def compute_change_scores(
@@ -146,9 +147,13 @@ def compute_change_scores(
         sigma=[0.3, 0.7, 0.7],
     ).astype(np.float32)
 
-    # 5. Mask background
+    # 5. Mask background and edge slices
     if fg_mask_new is not None:
         distances[~fg_mask_new] = 0.0
+    if D > 2 * EDGE_SLICES:
+        distances[:EDGE_SLICES] = 0.0
+        distances[-EDGE_SLICES:] = 0.0
+        print(f"  Edge trimming: zeroed slices 0-{EDGE_SLICES-1} and {D-EDGE_SLICES}-{D-1}")
 
     # 6. Debug stats
     if fg_mask_new is not None and fg_mask_new.any():
@@ -171,6 +176,15 @@ def compute_change_scores(
         for s in top5:
             print(f"    Slice {s}: mean={slice_means[s]:.4f}, "
                   f"max={distances[s].max():.4f}")
+
+        # Full per-slice profile (every 10th slice)
+        print(f"  Per-slice distance profile (every 10th):")
+        for s in range(0, D, 10):
+            sm = slice_means[s]
+            bar = "#" * int(sm * 100)
+            print(f"    Slice {s:3d}: mean={sm:.4f} {bar}")
+
+        np.save("outputs/diagnostic_slice_profile.npy", slice_means)
     else:
         print(f"  Distances: min={distances.min():.4f}, max={distances.max():.4f}")
 
