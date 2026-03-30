@@ -54,7 +54,7 @@ def _create_foreground_mask(
 
 MAX_BANK_SIZE = 60_000  # use all foreground patches (no subsampling)
 CHUNK_SIZE = 500        # process new patches in chunks to limit memory
-EDGE_SLICES = 5         # trim first/last N slices (different scan coverage)
+EDGE_SLICES = 10        # trim first/last N slices (different scan coverage)
 
 
 def compute_change_scores(
@@ -140,6 +140,20 @@ def compute_change_scores(
 
     nn_distances = np.maximum(nn_distances, 0.0)
     distances = nn_distances.reshape(D, Hp, Wp)
+
+    # 3b. Per-slice z-score normalization (removes edge-to-center gradient)
+    #     Each slice gets its own baseline so hemorrhage stands out locally
+    for s in range(D):
+        if fg_mask_new is not None and fg_mask_new[s].any():
+            fg_vals = distances[s][fg_mask_new[s]]
+            median_s = np.median(fg_vals)
+            mad_s = np.median(np.abs(fg_vals - median_s))
+            mad_s = max(mad_s, 1e-6)
+            distances[s] = np.maximum(
+                (distances[s] - median_s) / (1.4826 * mad_s), 0.0
+            )
+        else:
+            distances[s] = 0.0
 
     # 4. Light Gaussian smoothing
     distances = gaussian_filter(
