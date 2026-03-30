@@ -352,7 +352,7 @@ def extract_features(
 
     Returns
     -------
-    patch_features : [D, Hp, Wp, 768]
+    patch_features : [D, Hp, Wp, 2304] — concatenated from 3 layers
     cls_tokens : [D, 768] — from final output (post-norm), for slice matching
     """
     D, C, H, W = volume.shape
@@ -371,7 +371,9 @@ def extract_features(
 
     Hp = H // patch_size
     Wp = W // patch_size
-    embed_dim = 768
+    embed_dim_per_layer = 768
+    n_layers = len(EXTRACT_LAYERS)
+    embed_dim = embed_dim_per_layer * n_layers  # 2304
     expected = Hp * Wp
     n_skip = 1 + n_register  # CLS + register tokens to skip
 
@@ -383,7 +385,7 @@ def extract_features(
     extractor = _MultiLayerHookExtractor(model, EXTRACT_LAYERS)
 
     all_features = np.empty((D, Hp, Wp, embed_dim), dtype=np.float32)
-    all_cls = np.empty((D, embed_dim), dtype=np.float32)
+    all_cls = np.empty((D, embed_dim_per_layer), dtype=np.float32)
 
     for i in range(D):
         slice_tensor = torch.from_numpy(volume[i : i + 1]).to(device)
@@ -395,7 +397,7 @@ def extract_features(
         # CLS token from final output (post model.norm)
         all_cls[i] = output[:, 0, :].cpu().numpy()
 
-        # Extract and average patch tokens from hooked layers
+        # Extract patch tokens from hooked layers, L2-norm each, concatenate
         layer_features = []
         for layer_idx in EXTRACT_LAYERS:
             block_out = extractor.features[layer_idx]  # [1, 1+n_reg+n_patches, 768]
@@ -407,18 +409,21 @@ def extract_features(
                 if n_skip_auto > 0:
                     patches = block_out[:, n_skip_auto:, :]
             patches = patches[:, :expected, :]
-            patches = patches.reshape(1, Hp, Wp, embed_dim)
+            patches = patches.reshape(1, Hp, Wp, embed_dim_per_layer)
 
+            # L2-normalize per layer BEFORE concatenation
+            patches = nn.functional.normalize(patches, dim=-1)
             layer_features.append(patches)
 
-        # Average across layers (raw features — no L2 normalization to preserve magnitude)
-        averaged = torch.stack(layer_features, dim=0).mean(dim=0)  # [1, Hp, Wp, 768]
+        # Concatenate layers then L2-normalize the full vector
+        concatenated = torch.cat(layer_features, dim=-1)  # [1, Hp, Wp, 2304]
+        concatenated = nn.functional.normalize(concatenated, dim=-1)
 
-        all_features[i] = averaged[0].cpu().numpy()
+        all_features[i] = concatenated[0].cpu().numpy()
 
         # Clear hook storage and GPU memory
         extractor.clear()
-        del slice_tensor, output, averaged, layer_features
+        del slice_tensor, output, concatenated, layer_features
         if hasattr(torch, "mps") and hasattr(torch.mps, "empty_cache"):
             torch.mps.empty_cache()
 

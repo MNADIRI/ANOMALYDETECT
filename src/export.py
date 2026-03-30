@@ -64,12 +64,31 @@ def create_dicom_seg(
             np.float32
         )
 
-    # Fixed z-score thresholds
-    alert_threshold = threshold * 1.5
+    # Percentile-based thresholding on foreground scores
+    fg_scores = z_scores[z_scores > 0]
 
-    # Segment 1: "vigilance" zone — z > threshold (default 3.0)
-    mask_vigilance = z_scores > threshold
-    # Segment 2: "alert" zone — z > alert_threshold (default 4.5)
+    if fg_scores.size == 0:
+        print("  No foreground scores — generating minimal SEG")
+        vigilance_threshold = 999.0
+        alert_threshold = 999.0
+    else:
+        # Map user slider (1.5–6.0) to percentiles
+        # threshold=3.0 (default) → vigilance at p95, alert at p96.5
+        # threshold=1.5 (sensitive) → vigilance at p92.5, alert at p94
+        # threshold=6.0 (strict) → vigilance at p100 (capped at p99.9)
+        pct_vigilance = min(90 + threshold * (10.0 / 6.0), 99.9)
+        pct_alert = min(pct_vigilance + 1.5, 99.95)
+
+        vigilance_threshold = np.percentile(fg_scores, pct_vigilance)
+        alert_threshold = np.percentile(fg_scores, pct_alert)
+
+        print(f"  Thresholds: vigilance={vigilance_threshold:.6f} "
+              f"(p{pct_vigilance:.1f}), "
+              f"alert={alert_threshold:.6f} (p{pct_alert:.1f})")
+
+    # Segment 1: "vigilance" zone
+    mask_vigilance = z_scores > vigilance_threshold
+    # Segment 2: "alert" zone
     mask_alert = z_scores > alert_threshold
 
     # Remove alert areas from vigilance (no overlap)
@@ -78,11 +97,6 @@ def create_dicom_seg(
     has_vigilance = mask_vigilance_only.any()
     has_alert = mask_alert.any()
 
-    # NO fallback percentile logic — if nothing crosses threshold, that's correct
-    # (no false positives on identical scans)
-
-    print(f"  DICOM SEG: vigilance threshold={threshold:.1f}, "
-          f"alert threshold={alert_threshold:.1f}")
     print(f"  Vigilance voxels: {mask_vigilance_only.sum()}, "
           f"Alert voxels: {mask_alert.sum()}")
 

@@ -1,6 +1,6 @@
 """
 DICOM ingestion: reads a folder of DICOM CT files and produces
-standardised HU volumes and CLAHE-enhanced adaptive 3-channel volumes.
+standardised HU volumes and adaptive 3-channel windowed volumes.
 """
 
 import os
@@ -9,28 +9,27 @@ from collections import Counter
 import numpy as np
 import pydicom
 import SimpleITK as sitk
-from skimage.exposure import equalize_adapthist
 
 
 # ---------------------------------------------------------------------------
-# Region-aware HU windowing + CLAHE
+# Region-aware HU windowing
 # ---------------------------------------------------------------------------
 
 REGION_PRESETS = {
     "brain": [
-        ("soft", 40, 80),      # brain parenchyma — tight window preserves hemorrhage contrast
-        ("blood", 75, 50),     # acute blood (50-100 HU) — narrow window maximises contrast
-        ("bone", 600, 2800),   # calvarium
+        ("brain",    40,   80),    # parenchyme vs hémorragie — Δ max
+        ("subdural", 60,  200),    # vision élargie tissus mous + sang
+        ("bone",    500, 2500),    # crâne, calcifications
     ],
     "chest": [
-        ("mediastinum", 40, 400),
-        ("lung", -600, 1500),
-        ("bone", 300, 1500),
+        ("mediastinum", 40,  400),
+        ("lung",      -600, 1500),
+        ("bone",       300, 1500),
     ],
     "abdomen": [
-        ("soft", 40, 400),
+        ("soft",  40,  400),
         ("lung", -600, 1500),
-        ("bone", 300, 1500),
+        ("bone",  300, 1500),
     ],
 }
 REGION_PRESETS["default"] = REGION_PRESETS["abdomen"]
@@ -100,38 +99,15 @@ def _apply_window(hu: np.ndarray, center: float, width: float) -> np.ndarray:
     return out.astype(np.float32)
 
 
-def apply_clahe_slice(
-    img: np.ndarray,
-    clip_limit: float = 0.03,
-    kernel_size: int = 64,
-) -> np.ndarray:
-    """Apply CLAHE to a single 2D slice already in [0, 1]."""
-    return equalize_adapthist(
-        img, clip_limit=clip_limit, kernel_size=kernel_size,
-    ).astype(np.float32)
-
-
-def apply_clahe_volume(
-    vol: np.ndarray,
-    clip_limit: float = 0.03,
-    kernel_size: int = 64,
-) -> np.ndarray:
-    """Apply CLAHE slice-by-slice to a [D, H, W] volume in [0, 1]."""
-    out = np.empty_like(vol)
-    for i in range(vol.shape[0]):
-        out[i] = apply_clahe_slice(vol[i], clip_limit, kernel_size)
-    return out
-
-
 def adaptive_triple_channel(
     hu_volume: np.ndarray,
     metadata: dict,
     body_region: str | None = None,
 ) -> tuple[np.ndarray, str]:
     """
-    Convert HU volume [D, H, W] → CLAHE-enhanced 3-channel [D, 3, H, W].
+    Convert HU volume [D, H, W] → 3-channel [D, 3, H, W].
 
-    Uses region-specific HU windows + per-channel CLAHE for local contrast.
+    Uses region-specific HU windows normalised to [0, 1].
     Returns (volume_3ch, detected_region).
     """
     if body_region is None:
@@ -144,10 +120,8 @@ def adaptive_triple_channel(
     channels = []
     for name, center, width in preset:
         windowed = _apply_window(hu_volume, center, width)
-        enhanced = apply_clahe_volume(windowed)
-        channels.append(enhanced)
-        print(f"    Channel '{name}': CLAHE applied, "
-              f"range [{enhanced.min():.3f}, {enhanced.max():.3f}]")
+        channels.append(windowed)
+        print(f"    Channel '{name}': range [{windowed.min():.3f}, {windowed.max():.3f}]")
 
     volume_3ch = np.stack(channels, axis=1)  # [D, 3, H, W]
     return volume_3ch, body_region
@@ -157,7 +131,7 @@ def adaptive_triple_channel(
 # Main ingestion function
 # ---------------------------------------------------------------------------
 
-TARGET_SIZE = 512  # in-plane pixel size for the prototype
+TARGET_SIZE = 518  # 37 × 14 — DINOv2 ViT-B14 native (no padding needed)
 
 
 def ingest_dicom_folder(

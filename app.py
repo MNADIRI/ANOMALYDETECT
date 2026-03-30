@@ -24,7 +24,7 @@ from src.registration import (
     apply_transform_to_multichannel,
 )
 from src.features import load_model, extract_features, match_slices
-from src.scoring import fit_pca, compute_change_scores, upsample_scores
+from src.scoring import compute_change_scores, upsample_scores
 from src.export import create_dicom_seg
 
 app = FastAPI(title="CT Control Volume")
@@ -114,19 +114,14 @@ def run_pipeline_job(job_id: str, ref_path: str, new_path: str, threshold: float
         feat_ref_matched = feat_ref[matched_indices]
         del feat_ref, cls_ref, cls_new
 
-        # Phase 4a: PCA fitting (on reference features)
-        update(80, "Fitting PCA on reference subspace (n=64)...")
-        pca_model = fit_pca(feat_ref_matched, n_components=64)
-
-        # Phase 4b: Scoring (PCA reconstruction error + z-score)
-        update(84, "Computing change scores (reconstruction error + z-score)...")
+        # Phase 4: Scoring (nearest neighbor cosine distance)
+        update(82, "Computing change scores (nearest neighbor cosine)...")
         z_scores = compute_change_scores(
             feat_new, feat_ref_matched,
-            pca=pca_model,
             volume_hu_new=vol_new_hu,
             patch_size=patch_size,
         )
-        del feat_ref_matched, feat_new, pca_model
+        del feat_ref_matched, feat_new
 
         update(87, "Upsampling scores to native resolution...")
         print(f"  Score grid: {z_scores.shape}")

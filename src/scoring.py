@@ -1,61 +1,10 @@
 """
-Anomaly scoring: PCA reconstruction error on reference-fitted subspace
-with z-score normalization.
+Anomaly scoring: direct nearest-neighbor cosine distance (AnomalyDINO paradigm)
+with 3×3 spatial tolerance and foreground masking.
 """
 
 import numpy as np
 from scipy.ndimage import gaussian_filter, zoom
-from sklearn.decomposition import PCA
-
-
-# ---------------------------------------------------------------------------
-# PCA with whitening — fitted on reference features
-# ---------------------------------------------------------------------------
-
-def fit_pca(
-    feat_ref: np.ndarray,
-    fg_mask: np.ndarray | None = None,
-    n_components: int = 64,
-) -> PCA:
-    """
-    Fit PCA (whitened) on reference features only.
-
-    Parameters
-    ----------
-    feat_ref : [D, Hp, Wp, 768] — reference patch features (L2-normalized)
-    fg_mask : [D, Hp, Wp] bool — foreground mask (optional, for fitting)
-    n_components : PCA dimensionality
-
-    Returns
-    -------
-    pca : fitted PCA model
-    """
-    D, Hp, Wp, C = feat_ref.shape
-
-    # Collect reference patches for PCA fitting
-    if fg_mask is not None and fg_mask.any():
-        ref_flat = feat_ref[fg_mask]  # [N_fg, 768]
-    else:
-        ref_flat = feat_ref.reshape(-1, C)
-
-    # Subsample to 50000 for speed
-    max_samples = 50_000
-    if ref_flat.shape[0] > max_samples:
-        rng = np.random.default_rng(42)
-        idx = rng.choice(ref_flat.shape[0], max_samples, replace=False)
-        ref_sample = ref_flat[idx]
-    else:
-        ref_sample = ref_flat
-
-    # Fit PCA with whitening on reference
-    pca = PCA(n_components=n_components, whiten=False, random_state=42)
-    pca.fit(ref_sample)
-
-    variance_explained = pca.explained_variance_ratio_.sum()
-    print(f"  PCA: {n_components} components, whiten=False, "
-          f"variance explained: {variance_explained:.1%}")
-
-    return pca
 
 
 # ---------------------------------------------------------------------------
@@ -107,60 +56,53 @@ def _create_foreground_mask(
 
 
 # ---------------------------------------------------------------------------
-# Scoring: PCA reconstruction error + z-score normalization
+# Scoring: direct cosine distance with 3×3 spatial tolerance
 # ---------------------------------------------------------------------------
 
 def compute_change_scores(
     features_new: np.ndarray,
     features_ref: np.ndarray,
-    pca: PCA,
     volume_hu_new: np.ndarray | None = None,
     patch_size: int = 14,
 ) -> np.ndarray:
     """
-    Compute change scores using PCA reconstruction error.
+    Compute change scores using direct cosine distance (AnomalyDINO paradigm).
 
-    The PCA was fitted on reference features. Anomalous regions in the new
-    scan will have high reconstruction error because they don't fit the
-    reference subspace.
-
-    Z-score normalization uses the reference reconstruction error distribution
-    as baseline.
+    For each patch in the new scan, find the best matching patch in the
+    reference scan within a 3×3 spatial neighborhood, and use cosine
+    distance as the anomaly score.
 
     Parameters
     ----------
-    features_new : [D, Hp, Wp, 768] — new scan features (original, NOT PCA-transformed)
-    features_ref : [D, Hp, Wp, 768] — reference features (original)
-    pca : fitted PCA model (from fit_pca)
+    features_new : [D, Hp, Wp, C] — new scan features (L2-normalized, C=2304)
+    features_ref : [D, Hp, Wp, C] — reference features (L2-normalized, C=2304)
     volume_hu_new : [D_hu, H, W] — HU volume for foreground masking
-    patch_size : ViT patch size (unused, kept for API compatibility)
+    patch_size : ViT patch size (unused, kept for API compat)
 
     Returns
     -------
-    z_scores : [D, Hp, Wp] float32 — z-score normalized change map
+    scores : [D, Hp, Wp] float32 — raw cosine distance scores
     """
     D, Hp, Wp, C = features_new.shape
+    eps = 1e-8
 
-    # 1. Compute reconstruction error for both volumes
-    new_flat = features_new.reshape(-1, C)
-    ref_flat = features_ref.reshape(-1, C)
+    # 1. L2-normalize (should already be, but safety)
+    new_norm = features_new / (np.linalg.norm(features_new, axis=-1, keepdims=True) + eps)
+    ref_norm = features_ref / (np.linalg.norm(features_ref, axis=-1, keepdims=True) + eps)
 
-    new_projected = pca.transform(new_flat)
-    new_reconstructed = pca.inverse_transform(new_projected)
-    recon_error_new = np.linalg.norm(new_flat - new_reconstructed, axis=-1)
-    recon_error_new = recon_error_new.reshape(D, Hp, Wp).astype(np.float32)
+    # 2. Cosine distance with 3×3 spatial tolerance
+    ref_padded = np.pad(ref_norm, ((0, 0), (1, 1), (1, 1), (0, 0)), mode='edge')
+    best_sim = np.full((D, Hp, Wp), -1.0, dtype=np.float32)
+    for di in range(3):
+        for dj in range(3):
+            candidate = ref_padded[:, di:di + Hp, dj:dj + Wp, :]
+            sim = np.sum(new_norm * candidate, axis=-1)
+            best_sim = np.maximum(best_sim, sim)
 
-    ref_projected = pca.transform(ref_flat)
-    ref_reconstructed = pca.inverse_transform(ref_projected)
-    recon_error_ref = np.linalg.norm(ref_flat - ref_reconstructed, axis=-1)
-    recon_error_ref = recon_error_ref.reshape(D, Hp, Wp).astype(np.float32)
+    distances = 1.0 - best_sim
+    distances = np.maximum(distances, 0.0)
 
-    print(f"  Reconstruction error — new: mean={recon_error_new.mean():.6f}, "
-          f"max={recon_error_new.max():.6f}")
-    print(f"  Reconstruction error — ref: mean={recon_error_ref.mean():.6f}, "
-          f"max={recon_error_ref.max():.6f}")
-
-    # 2. Foreground mask
+    # 3. Foreground mask
     fg_mask = None
     if volume_hu_new is not None:
         fg_mask = _create_foreground_mask(volume_hu_new, (D, Hp, Wp))
@@ -168,45 +110,27 @@ def compute_change_scores(
         print(f"  Foreground mask: {n_fg}/{fg_mask.size} patches "
               f"({100 * n_fg / fg_mask.size:.1f}%)")
 
-    # 3. Z-score normalization using REFERENCE reconstruction error as baseline
-    #    This way, normal anatomy that reconstructs similarly in both scans
-    #    gets low z-scores, while hemorrhage (high recon error in new, low in ref)
-    #    gets high z-scores.
-    if fg_mask is not None and fg_mask.any():
-        ref_fg_errors = recon_error_ref[fg_mask]
-    else:
-        ref_fg_errors = recon_error_ref.ravel()
-
-    median_ref = np.median(ref_fg_errors)
-    mad_ref = np.median(np.abs(ref_fg_errors - median_ref))
-    mad_ref = max(mad_ref, 1e-6)  # minimal floor — only prevent division by zero
-
-    z_scores = (recon_error_new - median_ref) / (1.4826 * mad_ref)
-    z_scores = np.maximum(z_scores, 0.0)  # only positive z-scores
-
-    # 4. Gaussian smoothing
-    z_scores = gaussian_filter(
-        z_scores.astype(np.float64),
-        sigma=[0.5, 1.0, 1.0],
+    # 4. Light Gaussian smoothing
+    distances = gaussian_filter(
+        distances.astype(np.float64),
+        sigma=[0.3, 0.7, 0.7],
     ).astype(np.float32)
 
     # 5. Mask background
     if fg_mask is not None:
-        z_scores[~fg_mask] = 0.0
+        distances[~fg_mask] = 0.0
 
-    # Debug stats
+    # 6. Debug stats
     if fg_mask is not None and fg_mask.any():
-        fg_z = z_scores[fg_mask]
-        print(f"  Z-scores (fg): median_ref_error={median_ref:.6f}, MAD={mad_ref:.6f}")
-        print(f"  Z-scores (fg): min={fg_z.min():.2f}, max={fg_z.max():.2f}, "
-              f"mean={fg_z.mean():.2f}, "
-              f"p95={np.percentile(fg_z, 95):.2f}, "
-              f"p99={np.percentile(fg_z, 99):.2f}")
-        print(f"  Above z>3: {(fg_z > 3).sum()}, z>5: {(fg_z > 5).sum()}")
+        fg_d = distances[fg_mask]
+        print(f"  Cosine distances (fg): min={fg_d.min():.4f}, max={fg_d.max():.4f}, "
+              f"mean={fg_d.mean():.4f}, "
+              f"p95={np.percentile(fg_d, 95):.4f}, "
+              f"p99={np.percentile(fg_d, 99):.4f}")
     else:
-        print(f"  Z-scores: min={z_scores.min():.2f}, max={z_scores.max():.2f}")
+        print(f"  Distances: min={distances.min():.4f}, max={distances.max():.4f}")
 
-    return z_scores
+    return distances
 
 
 def upsample_scores(
