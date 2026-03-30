@@ -116,41 +116,12 @@ def run_pipeline_job(job_id: str, ref_path: str, new_path: str, threshold: float
         feat_ref_matched = feat_ref[matched_indices]
         del feat_ref, cls_ref, cls_new
 
-        # === DIAGNOSTIC — raw cosine distance analysis ===
-        os.makedirs("outputs", exist_ok=True)
-        eps = 1e-8
-        f_new = feat_new / (np.linalg.norm(feat_new, axis=-1, keepdims=True) + eps)
-        f_ref = feat_ref_matched / (np.linalg.norm(feat_ref_matched, axis=-1, keepdims=True) + eps)
-        raw_sim = np.sum(f_new * f_ref, axis=-1)  # [D, Hp, Wp]
-        raw_dist = 1.0 - raw_sim
-
-        print(f"\n{'='*60}")
-        print(f"DIAGNOSTIC — Raw cosine distance (no tolerance, no smoothing)")
-        print(f"  Shape: {raw_dist.shape}")
-        print(f"  Global:  min={raw_dist.min():.6f}  max={raw_dist.max():.6f}  "
-              f"mean={raw_dist.mean():.6f}  std={raw_dist.std():.6f}")
-
-        slice_maxes = raw_dist.max(axis=(1, 2))
-        top_slices = np.argsort(slice_maxes)[-5:][::-1]
-        print(f"  Top 5 slices by max distance: {top_slices}")
-        for s in top_slices:
-            print(f"    Slice {s}: max={slice_maxes[s]:.6f}  "
-                  f"p99={np.percentile(raw_dist[s], 99):.6f}  "
-                  f"mean={raw_dist[s].mean():.6f}")
-
-        overall_mean = raw_dist.mean()
-        overall_max = raw_dist.max()
-        print(f"  Signal/noise ratio: max/mean = {overall_max/overall_mean:.1f}x")
-        print(f"{'='*60}\n")
-
-        np.save("outputs/diagnostic_raw_dist.npy", raw_dist)
-        del f_new, f_ref, raw_sim, raw_dist
-
-        # Phase 4: Scoring (nearest neighbor cosine distance)
-        update(82, "Computing change scores (nearest neighbor cosine)...")
+        # Phase 4: Scoring (memory bank nearest neighbor)
+        update(82, "Computing change scores (memory bank NN)...")
         z_scores = compute_change_scores(
             feat_new, feat_ref_matched,
             volume_hu_new=vol_new_hu,
+            volume_hu_ref=vol_ref_hu_reg,
             patch_size=patch_size,
         )
         del feat_ref_matched, feat_new
