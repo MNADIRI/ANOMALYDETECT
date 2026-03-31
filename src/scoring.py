@@ -1,9 +1,11 @@
 """
-Anomaly scoring: PatchCore-style memory bank nearest neighbor.
+Anomaly scoring: Position-aware local nearest neighbor + HU validation.
 
-Builds a gallery of all foreground patches from the reference (normal) scan.
-For each new scan patch, finds the nearest neighbor in the gallery.
-Anomaly score = cosine distance to nearest neighbor.
+Exploits spatial correspondence from registration + slice matching.
+For each patch (s, i, j) in the new scan, compares only to patches
+in a local spatial neighborhood around (s, i, j) in the registered
+reference. HU difference amplifies feature anomalies where density
+actually changed (hemorrhage = HU increase).
 """
 
 import numpy as np
@@ -49,14 +51,126 @@ def _create_foreground_mask(
 
 
 # ---------------------------------------------------------------------------
-# Scoring: PatchCore-style memory bank nearest neighbor
+# Position-aware local scoring
 # ---------------------------------------------------------------------------
 
-MAX_BANK_SIZE = 60_000  # use all foreground patches (no subsampling)
-CHUNK_SIZE = 500        # process new patches in chunks to limit memory
-EDGE_SLICES = 10        # trim first/last N slices (different scan coverage)
-K_NEIGHBORS = 5         # k-NN: average distance to k nearest neighbors
+SPATIAL_WINDOW = 3   # ±3 patches in i, j
+SLICE_WINDOW = 1     # ±1 slice in z
+EDGE_SLICES = 10     # trim first/last N slices
 
+
+def _position_aware_distance(
+    feat_new: np.ndarray,
+    feat_ref: np.ndarray,
+) -> np.ndarray:
+    """
+    Position-aware local nearest neighbor cosine distance.
+
+    For each patch (s, i, j) in feat_new, finds the best cosine match
+    in feat_ref within a local neighborhood [s±SLICE_WINDOW, i±SPATIAL_WINDOW,
+    j±SPATIAL_WINDOW]. Fully vectorized via spatial offset iteration.
+
+    Parameters
+    ----------
+    feat_new : [D, Hp, Wp, C] — new scan features
+    feat_ref : [D, Hp, Wp, C] — registered+slice-matched reference features
+
+    Returns
+    -------
+    distances : [D, Hp, Wp] — cosine distance to best local match
+    """
+    D, Hp, Wp, C = feat_new.shape
+    eps = 1e-8
+
+    # L2-normalize both volumes
+    feat_new_n = feat_new / (np.linalg.norm(feat_new, axis=-1, keepdims=True) + eps)
+    feat_ref_n = feat_ref / (np.linalg.norm(feat_ref, axis=-1, keepdims=True) + eps)
+
+    best_sim = np.full((D, Hp, Wp), -1.0, dtype=np.float32)
+    n_offsets = 0
+
+    for ds in range(-SLICE_WINDOW, SLICE_WINDOW + 1):
+        for di in range(-SPATIAL_WINDOW, SPATIAL_WINDOW + 1):
+            for dj in range(-SPATIAL_WINDOW, SPATIAL_WINDOW + 1):
+                # Valid overlap regions (no wraparound)
+                s_new_lo = max(0, -ds)
+                s_new_hi = min(D, D - ds)
+                s_ref_lo = max(0, ds)
+                s_ref_hi = min(D, D + ds)
+
+                i_new_lo = max(0, -di)
+                i_new_hi = min(Hp, Hp - di)
+                i_ref_lo = max(0, di)
+                i_ref_hi = min(Hp, Hp + di)
+
+                j_new_lo = max(0, -dj)
+                j_new_hi = min(Wp, Wp - dj)
+                j_ref_lo = max(0, dj)
+                j_ref_hi = min(Wp, Wp + dj)
+
+                if s_new_hi <= s_new_lo or i_new_hi <= i_new_lo or j_new_hi <= j_new_lo:
+                    continue
+
+                # Cosine similarity at all overlapping positions
+                sim = (
+                    feat_new_n[s_new_lo:s_new_hi, i_new_lo:i_new_hi, j_new_lo:j_new_hi, :]
+                    * feat_ref_n[s_ref_lo:s_ref_hi, i_ref_lo:i_ref_hi, j_ref_lo:j_ref_hi, :]
+                ).sum(axis=-1)
+
+                best_sim[s_new_lo:s_new_hi, i_new_lo:i_new_hi, j_new_lo:j_new_hi] = np.maximum(
+                    best_sim[s_new_lo:s_new_hi, i_new_lo:i_new_hi, j_new_lo:j_new_hi],
+                    sim,
+                )
+                n_offsets += 1
+
+    print(f"  Position-aware scoring: {n_offsets} spatial offsets "
+          f"(window z=±{SLICE_WINDOW}, xy=±{SPATIAL_WINDOW})")
+
+    return 1.0 - np.maximum(best_sim, 0.0)
+
+
+# ---------------------------------------------------------------------------
+# HU difference scoring (patch-level)
+# ---------------------------------------------------------------------------
+
+def _compute_hu_diff(
+    vol_hu_new: np.ndarray,
+    vol_hu_ref: np.ndarray,
+    grid_shape: tuple[int, int, int],
+) -> np.ndarray:
+    """
+    Compute mean HU difference per patch block: new - ref.
+
+    Positive values = density increase (potential hemorrhage).
+    """
+    D, Hp, Wp = grid_shape
+    D_hu, H_hu, W_hu = vol_hu_new.shape
+
+    slice_ratio = D_hu / D
+    patch_h = H_hu / Hp
+    patch_w = W_hu / Wp
+
+    hu_diff = np.zeros((D, Hp, Wp), dtype=np.float32)
+
+    for d in range(D):
+        d_s = int(d * slice_ratio)
+        d_e = max(d_s + 1, min(int((d + 1) * slice_ratio), D_hu))
+        for i in range(Hp):
+            h_s = int(i * patch_h)
+            h_e = max(h_s + 1, min(int((i + 1) * patch_h), H_hu))
+            for j in range(Wp):
+                w_s = int(j * patch_w)
+                w_e = max(w_s + 1, min(int((j + 1) * patch_w), W_hu))
+                block_new = vol_hu_new[d_s:d_e, h_s:h_e, w_s:w_e]
+                block_ref = vol_hu_ref[d_s:d_e, h_s:h_e, w_s:w_e]
+                hu_diff[d, i, j] = block_new.mean() - block_ref.mean()
+
+    return hu_diff
+
+
+# ---------------------------------------------------------------------------
+# Main scoring function
+# ---------------------------------------------------------------------------
 
 def compute_change_scores(
     features_new: np.ndarray,
@@ -66,29 +180,30 @@ def compute_change_scores(
     patch_size: int = 14,
 ) -> np.ndarray:
     """
-    Compute anomaly scores using memory bank nearest neighbor (PatchCore).
+    Compute anomaly scores using position-aware local NN + HU validation.
 
-    Builds a gallery of all foreground reference patches. For each new
-    patch, finds the nearest neighbor in the gallery via cosine similarity.
-    Anomaly score = cosine distance to nearest neighbor.
+    Exploits spatial correspondence from registration + slice matching:
+    feat_ref[s, i, j] corresponds to the same anatomical position as
+    feat_new[s, i, j]. Compares each new patch only to a local spatial
+    neighborhood in the reference, then amplifies with HU difference.
 
-    This works for cross-patient comparison: normal tissues (GM, WM, CSF)
-    find good matches across patients; pathology (hemorrhage) doesn't.
+    Mathematical definition of "pathological":
+    A patch is pathological if its local cosine distance is a statistical
+    outlier (global z-score > threshold) AND/OR HU density changed.
 
     Parameters
     ----------
     features_new : [D, Hp, Wp, C] — new scan features (L2-normalized)
-    features_ref : [D_ref, Hp, Wp, C] — reference features (L2-normalized)
-    volume_hu_new : [D_hu, H, W] — HU volume for new scan foreground mask
-    volume_hu_ref : [D_hu_ref, H, W] — HU volume for reference foreground mask
+    features_ref : [D, Hp, Wp, C] — reference features (slice-matched, same D)
+    volume_hu_new : [D_hu, H, W] — HU volume for new scan
+    volume_hu_ref : [D_hu, H, W] — HU volume for reference (registered)
     patch_size : ViT patch size (unused, kept for API compat)
 
     Returns
     -------
-    scores : [D, Hp, Wp] float32 — cosine distance to nearest reference patch
+    scores : [D, Hp, Wp] float32 — anomaly z-scores
     """
     D, Hp, Wp, C = features_new.shape
-    D_ref = features_ref.shape[0]
     eps = 1e-8
 
     # 1. Build foreground masks
@@ -99,87 +214,76 @@ def compute_change_scores(
         print(f"  Foreground mask (new): {n_fg_new}/{fg_mask_new.size} patches "
               f"({100 * n_fg_new / fg_mask_new.size:.1f}%)")
 
-    fg_mask_ref = None
     if volume_hu_ref is not None:
-        fg_mask_ref = _create_foreground_mask(volume_hu_ref, (D_ref, Hp, Wp))
+        fg_mask_ref = _create_foreground_mask(
+            volume_hu_ref, (features_ref.shape[0], Hp, Wp),
+        )
         n_fg_ref = fg_mask_ref.sum()
         print(f"  Foreground mask (ref): {n_fg_ref}/{fg_mask_ref.size} patches "
               f"({100 * n_fg_ref / fg_mask_ref.size:.1f}%)")
 
-    # 2. Build reference memory bank (foreground patches only)
-    if fg_mask_ref is not None and fg_mask_ref.any():
-        ref_bank = features_ref[fg_mask_ref]  # [N_fg_ref, C]
+    # 2. Position-aware local nearest neighbor distance
+    distances = _position_aware_distance(features_new, features_ref)
+
+    # 3. HU difference boost (amplifies where density actually changed)
+    if volume_hu_new is not None and volume_hu_ref is not None:
+        hu_diff = _compute_hu_diff(volume_hu_new, volume_hu_ref, (D, Hp, Wp))
+
+        # Hemorrhage = density increase: boost score where HU went up
+        # +50 HU → boost factor 1.0 (doubles the score)
+        # +10 HU → boost factor 0.0 (no effect)
+        # negative → no effect (density decrease = not hemorrhage)
+        hu_boost = np.clip(np.maximum(hu_diff - 10.0, 0.0) / 40.0, 0.0, 2.0)
+        distances = distances * (1.0 + hu_boost)
+
+        # Diagnostic
+        if fg_mask_new is not None and fg_mask_new.any():
+            hu_fg = hu_diff[fg_mask_new]
+            print(f"  HU diff (fg): min={hu_fg.min():.1f}, max={hu_fg.max():.1f}, "
+                  f"mean={hu_fg.mean():.1f}, "
+                  f"patches with ΔHU>20: {(hu_fg > 20).sum()}")
+
+    # 4. Global z-score normalization
+    #    Position-aware scoring produces low baseline for normal tissue,
+    #    so global normalization correctly identifies outliers.
+    if fg_mask_new is not None and fg_mask_new.any():
+        fg_vals = distances[fg_mask_new]
+        global_median = np.median(fg_vals)
+        global_mad = np.median(np.abs(fg_vals - global_median))
+        global_mad = max(global_mad, eps)
+        print(f"  Global normalization: median={global_median:.4f}, "
+              f"MAD={global_mad:.4f}, σ_est={1.4826 * global_mad:.4f}")
+        distances = np.maximum(
+            (distances - global_median) / (1.4826 * global_mad), 0.0
+        )
     else:
-        ref_bank = features_ref.reshape(-1, C)
+        print("  WARNING: no foreground patches detected")
 
-    # Subsample for speed if too large
-    if ref_bank.shape[0] > MAX_BANK_SIZE:
-        rng = np.random.default_rng(42)
-        idx = rng.choice(ref_bank.shape[0], MAX_BANK_SIZE, replace=False)
-        ref_bank = ref_bank[idx]
-
-    # L2-normalize the bank (should already be, but safety)
-    ref_bank = ref_bank / (np.linalg.norm(ref_bank, axis=-1, keepdims=True) + eps)
-    print(f"  Memory bank: {ref_bank.shape[0]} reference patches, dim={C}")
-
-    # 3. For each new patch, find nearest neighbor in bank
-    new_flat = features_new.reshape(-1, C)
-    new_flat = new_flat / (np.linalg.norm(new_flat, axis=-1, keepdims=True) + eps)
-
-    n_new = new_flat.shape[0]
-    nn_distances = np.zeros(n_new, dtype=np.float32)
-
-    # Process in chunks to limit memory: chunk × bank matrix
-    for start in range(0, n_new, CHUNK_SIZE):
-        end = min(start + CHUNK_SIZE, n_new)
-        chunk = new_flat[start:end]  # [chunk_size, C]
-
-        # Cosine similarity: [chunk_size, bank_size]
-        sim = chunk @ ref_bank.T
-        # k-NN: average distance to K_NEIGHBORS nearest neighbors
-        k_actual = min(K_NEIGHBORS, sim.shape[1])
-        top_k_idx = np.argpartition(sim, -k_actual, axis=1)[:, -k_actual:]
-        top_k_sims = np.take_along_axis(sim, top_k_idx, axis=1)
-        nn_distances[start:end] = 1.0 - top_k_sims.mean(axis=1)
-
-    nn_distances = np.maximum(nn_distances, 0.0)
-    distances = nn_distances.reshape(D, Hp, Wp)
-
-    # 3b. Per-slice z-score normalization (removes edge-to-center gradient)
-    #     Each slice gets its own baseline so hemorrhage stands out locally
-    for s in range(D):
-        if fg_mask_new is not None and fg_mask_new[s].any():
-            fg_vals = distances[s][fg_mask_new[s]]
-            median_s = np.median(fg_vals)
-            mad_s = np.median(np.abs(fg_vals - median_s))
-            mad_s = max(mad_s, 1e-6)
-            distances[s] = np.maximum(
-                (distances[s] - median_s) / (1.4826 * mad_s), 0.0
-            )
-        else:
-            distances[s] = 0.0
-
-    # 4. Light Gaussian smoothing
+    # 5. Gaussian smoothing
     distances = gaussian_filter(
         distances.astype(np.float64),
-        sigma=[0.5, 1.2, 1.2],
+        sigma=[0.5, 1.0, 1.0],
     ).astype(np.float32)
 
-    # 5. Mask background and edge slices
+    # 6. Mask background and edge slices
     if fg_mask_new is not None:
         distances[~fg_mask_new] = 0.0
     if D > 2 * EDGE_SLICES:
         distances[:EDGE_SLICES] = 0.0
         distances[-EDGE_SLICES:] = 0.0
-        print(f"  Edge trimming: zeroed slices 0-{EDGE_SLICES-1} and {D-EDGE_SLICES}-{D-1}")
+        print(f"  Edge trimming: zeroed slices 0-{EDGE_SLICES - 1} "
+              f"and {D - EDGE_SLICES}-{D - 1}")
 
-    # 6. Debug stats
+    # 7. Debug stats
     if fg_mask_new is not None and fg_mask_new.any():
         fg_d = distances[fg_mask_new]
-        print(f"  NN distances (fg): min={fg_d.min():.4f}, max={fg_d.max():.4f}, "
+        fg_nonzero = fg_d[fg_d > 0]
+        print(f"  Final scores (fg): min={fg_d.min():.4f}, max={fg_d.max():.4f}, "
               f"mean={fg_d.mean():.4f}, "
               f"p95={np.percentile(fg_d, 95):.4f}, "
               f"p99={np.percentile(fg_d, 99):.4f}")
+        print(f"  Non-zero fg patches: {fg_nonzero.size}/{fg_d.size} "
+              f"({100 * fg_nonzero.size / max(fg_d.size, 1):.1f}%)")
 
         # Per-slice analysis
         slice_means = []
@@ -190,16 +294,16 @@ def compute_change_scores(
                 slice_means.append(0.0)
         slice_means = np.array(slice_means)
         top5 = np.argsort(slice_means)[-5:][::-1]
-        print(f"  Top 5 slices by mean NN distance: {top5}")
+        print(f"  Top 5 slices by mean score: {top5}")
         for s in top5:
             print(f"    Slice {s}: mean={slice_means[s]:.4f}, "
                   f"max={distances[s].max():.4f}")
 
-        # Full per-slice profile (every 10th slice)
-        print(f"  Per-slice distance profile (every 10th):")
+        # Per-slice profile (every 10th)
+        print(f"  Per-slice score profile (every 10th):")
         for s in range(0, D, 10):
             sm = slice_means[s]
-            bar = "#" * int(sm * 100)
+            bar = "#" * int(sm * 20)
             print(f"    Slice {s:3d}: mean={sm:.4f} {bar}")
 
         np.save("outputs/diagnostic_slice_profile.npy", slice_means)
