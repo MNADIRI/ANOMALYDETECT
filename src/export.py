@@ -12,6 +12,26 @@ import numpy as np
 import pydicom
 from pydicom.sr.codedict import codes
 from pydicom.uid import generate_uid
+from scipy.ndimage import binary_opening, binary_closing, binary_fill_holes, label
+
+
+def _clean_mask(mask: np.ndarray, min_component_size: int = 20) -> np.ndarray:
+    """Morphological cleanup: remove noise, fill holes, remove small components."""
+    if not mask.any():
+        return mask
+    # Close small gaps (dilation then erosion)
+    mask = binary_closing(mask, iterations=2)
+    # Fill internal holes per slice (3D fill can leak across slices)
+    for s in range(mask.shape[0]):
+        mask[s] = binary_fill_holes(mask[s])
+    # Remove small isolated 3D components
+    labeled, n_comp = label(mask)
+    for c in range(1, n_comp + 1):
+        if (labeled == c).sum() < min_component_size:
+            mask[labeled == c] = False
+    # Open to smooth edges (erosion then dilation)
+    mask = binary_opening(mask, iterations=1)
+    return mask.astype(bool)
 
 
 def create_dicom_seg(
@@ -90,6 +110,10 @@ def create_dicom_seg(
     mask_vigilance = z_scores > vigilance_threshold
     # Segment 2: "alert" zone
     mask_alert = z_scores > alert_threshold
+
+    # Morphological cleanup — fill holes, remove noise, smooth edges
+    mask_vigilance = _clean_mask(mask_vigilance)
+    mask_alert = _clean_mask(mask_alert)
 
     # Remove alert areas from vigilance (no overlap)
     mask_vigilance_only = mask_vigilance & ~mask_alert

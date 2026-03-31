@@ -55,6 +55,7 @@ def _create_foreground_mask(
 MAX_BANK_SIZE = 60_000  # use all foreground patches (no subsampling)
 CHUNK_SIZE = 500        # process new patches in chunks to limit memory
 EDGE_SLICES = 10        # trim first/last N slices (different scan coverage)
+K_NEIGHBORS = 5         # k-NN: average distance to k nearest neighbors
 
 
 def compute_change_scores(
@@ -135,8 +136,11 @@ def compute_change_scores(
 
         # Cosine similarity: [chunk_size, bank_size]
         sim = chunk @ ref_bank.T
-        best_sim = sim.max(axis=1)  # [chunk_size]
-        nn_distances[start:end] = 1.0 - best_sim
+        # k-NN: average distance to K_NEIGHBORS nearest neighbors
+        k_actual = min(K_NEIGHBORS, sim.shape[1])
+        top_k_idx = np.argpartition(sim, -k_actual, axis=1)[:, -k_actual:]
+        top_k_sims = np.take_along_axis(sim, top_k_idx, axis=1)
+        nn_distances[start:end] = 1.0 - top_k_sims.mean(axis=1)
 
     nn_distances = np.maximum(nn_distances, 0.0)
     distances = nn_distances.reshape(D, Hp, Wp)
@@ -158,7 +162,7 @@ def compute_change_scores(
     # 4. Light Gaussian smoothing
     distances = gaussian_filter(
         distances.astype(np.float64),
-        sigma=[0.3, 0.7, 0.7],
+        sigma=[0.5, 1.2, 1.2],
     ).astype(np.float32)
 
     # 5. Mask background and edge slices
