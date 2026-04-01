@@ -249,10 +249,10 @@ def compute_change_scores(
         hu_diff = _compute_hu_diff(volume_hu_new, volume_hu_ref, (D, Hp, Wp))
 
         # Hemorrhage = density increase: boost score where HU went up
-        # +50 HU → boost factor 1.0 (doubles the score)
-        # +10 HU → boost factor 0.0 (no effect)
+        # +65 HU → boost factor 1.0 (doubles the score)
+        # +25 HU → boost factor 0.0 (no effect, within normal variation)
         # negative → no effect (density decrease = not hemorrhage)
-        hu_boost = np.clip(np.maximum(hu_diff - 10.0, 0.0) / 40.0, 0.0, 2.0)
+        hu_boost = np.clip(np.maximum(hu_diff - 25.0, 0.0) / 40.0, 0.0, 2.0)
         distances = distances * (1.0 + hu_boost)
 
         # Diagnostic
@@ -293,7 +293,33 @@ def compute_change_scores(
         print(f"  Edge trimming: zeroed slices 0-{EDGE_SLICES - 1} "
               f"and {D - EDGE_SLICES}-{D - 1}")
 
-    # 7. Debug stats
+    # 7. Adaptive slice-level outlier removal
+    #    Removes entire slices dominated by registration artifacts
+    #    (e.g. maxillofacial region with sinuses, mandible positioning)
+    if fg_mask_new is not None:
+        slice_scores = np.array([
+            distances[s][fg_mask_new[s]].mean() if fg_mask_new[s].any() else 0.0
+            for s in range(D)
+        ])
+        active = slice_scores[slice_scores > 0]
+        if active.size > 10:
+            med_sm = np.median(active)
+            mad_sm = np.median(np.abs(active - med_sm))
+            mad_sm = max(mad_sm, 1e-6)
+            outlier_thresh = med_sm + 5 * 1.4826 * mad_sm
+
+            n_removed = 0
+            for s in range(D):
+                if slice_scores[s] > outlier_thresh:
+                    distances[s] = 0.0
+                    n_removed += 1
+                    print(f"    Outlier slice {s}: mean={slice_scores[s]:.2f} "
+                          f"(threshold={outlier_thresh:.2f})")
+            if n_removed > 0:
+                print(f"  Removed {n_removed} outlier slices "
+                      f"(threshold={outlier_thresh:.2f})")
+
+    # 8. Debug stats
     if fg_mask_new is not None and fg_mask_new.any():
         fg_d = distances[fg_mask_new]
         fg_nonzero = fg_d[fg_d > 0]
