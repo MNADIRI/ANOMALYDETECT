@@ -68,7 +68,10 @@ def _position_aware_distance(
 
     For each patch (s, i, j) in feat_new, finds the best cosine match
     in feat_ref within a local neighborhood [s±SLICE_WINDOW, i±SPATIAL_WINDOW,
-    j±SPATIAL_WINDOW]. Fully vectorized via spatial offset iteration.
+    j±SPATIAL_WINDOW].
+
+    Processes slice-by-slice to keep memory usage low (~12 MB temporaries
+    instead of ~2 GB when operating on the full volume).
 
     Parameters
     ----------
@@ -82,49 +85,65 @@ def _position_aware_distance(
     D, Hp, Wp, C = feat_new.shape
     eps = 1e-8
 
-    # L2-normalize both volumes
-    feat_new_n = feat_new / (np.linalg.norm(feat_new, axis=-1, keepdims=True) + eps)
-    feat_ref_n = feat_ref / (np.linalg.norm(feat_ref, axis=-1, keepdims=True) + eps)
-
     best_sim = np.full((D, Hp, Wp), -1.0, dtype=np.float32)
-    n_offsets = 0
 
-    for ds in range(-SLICE_WINDOW, SLICE_WINDOW + 1):
-        for di in range(-SPATIAL_WINDOW, SPATIAL_WINDOW + 1):
-            for dj in range(-SPATIAL_WINDOW, SPATIAL_WINDOW + 1):
-                # Valid overlap regions (no wraparound)
-                s_new_lo = max(0, -ds)
-                s_new_hi = min(D, D - ds)
-                s_ref_lo = max(0, ds)
-                s_ref_hi = min(D, D + ds)
+    # Cache for normalized ref slices (avoid redundant computation)
+    ref_norm_cache: dict[int, np.ndarray] = {}
 
-                i_new_lo = max(0, -di)
-                i_new_hi = min(Hp, Hp - di)
-                i_ref_lo = max(0, di)
-                i_ref_hi = min(Hp, Hp + di)
+    def _get_ref_normalized(s_ref: int) -> np.ndarray:
+        if s_ref not in ref_norm_cache:
+            fr = feat_ref[s_ref].astype(np.float32)
+            norms = np.linalg.norm(fr, axis=-1, keepdims=True)
+            ref_norm_cache[s_ref] = fr / (norms + eps)
+            # Keep cache small: only need current ± SLICE_WINDOW
+            stale = [k for k in ref_norm_cache if k < s_ref - SLICE_WINDOW - 1]
+            for k in stale:
+                del ref_norm_cache[k]
+        return ref_norm_cache[s_ref]
 
-                j_new_lo = max(0, -dj)
-                j_new_hi = min(Wp, Wp - dj)
-                j_ref_lo = max(0, dj)
-                j_ref_hi = min(Wp, Wp + dj)
+    # Pre-compute spatial offset ranges (same for every slice)
+    offsets_ij = []
+    for di in range(-SPATIAL_WINDOW, SPATIAL_WINDOW + 1):
+        for dj in range(-SPATIAL_WINDOW, SPATIAL_WINDOW + 1):
+            i_new_lo = max(0, -di)
+            i_new_hi = min(Hp, Hp - di)
+            i_ref_lo = max(0, di)
+            i_ref_hi = min(Hp, Hp + di)
+            j_new_lo = max(0, -dj)
+            j_new_hi = min(Wp, Wp - dj)
+            j_ref_lo = max(0, dj)
+            j_ref_hi = min(Wp, Wp + dj)
+            if i_new_hi > i_new_lo and j_new_hi > j_new_lo:
+                offsets_ij.append((
+                    i_new_lo, i_new_hi, i_ref_lo, i_ref_hi,
+                    j_new_lo, j_new_hi, j_ref_lo, j_ref_hi,
+                ))
 
-                if s_new_hi <= s_new_lo or i_new_hi <= i_new_lo or j_new_hi <= j_new_lo:
-                    continue
+    n_offsets = (2 * SLICE_WINDOW + 1) * len(offsets_ij)
 
-                # Cosine similarity at all overlapping positions
-                sim = (
-                    feat_new_n[s_new_lo:s_new_hi, i_new_lo:i_new_hi, j_new_lo:j_new_hi, :]
-                    * feat_ref_n[s_ref_lo:s_ref_hi, i_ref_lo:i_ref_hi, j_ref_lo:j_ref_hi, :]
-                ).sum(axis=-1)
+    for s in range(D):
+        # Normalize new slice (~12 MB, not 2.1 GB)
+        fn = feat_new[s].astype(np.float32)
+        fn_norms = np.linalg.norm(fn, axis=-1, keepdims=True)
+        fn = fn / (fn_norms + eps)
 
-                best_sim[s_new_lo:s_new_hi, i_new_lo:i_new_hi, j_new_lo:j_new_hi] = np.maximum(
-                    best_sim[s_new_lo:s_new_hi, i_new_lo:i_new_hi, j_new_lo:j_new_hi],
-                    sim,
+        for ds in range(-SLICE_WINDOW, SLICE_WINDOW + 1):
+            s_ref = s + ds
+            if s_ref < 0 or s_ref >= D:
+                continue
+            fr = _get_ref_normalized(s_ref)
+
+            for (inl, inh, irl, irh, jnl, jnh, jrl, jrh) in offsets_ij:
+                sim = (fn[inl:inh, jnl:jnh, :] * fr[irl:irh, jrl:jrh, :]).sum(axis=-1)
+                best_sim[s, inl:inh, jnl:jnh] = np.maximum(
+                    best_sim[s, inl:inh, jnl:jnh], sim,
                 )
-                n_offsets += 1
 
-    print(f"  Position-aware scoring: {n_offsets} spatial offsets "
-          f"(window z=±{SLICE_WINDOW}, xy=±{SPATIAL_WINDOW})")
+        if s % 25 == 0:
+            print(f"    Position-aware: slice {s}/{D}...")
+
+    print(f"  Position-aware scoring: {n_offsets} offsets/slice "
+          f"(z=±{SLICE_WINDOW}, xy=±{SPATIAL_WINDOW}), {D} slices")
 
     return 1.0 - np.maximum(best_sim, 0.0)
 
