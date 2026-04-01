@@ -84,7 +84,12 @@ def create_dicom_seg(
             np.float32
         )
 
-    # Percentile-based thresholding on foreground scores
+    # Absolute z-score thresholding
+    # Scores from scoring.py are already z-scores (global median + MAD normalized).
+    # The user slider directly controls the z-score cutoff:
+    #   threshold=1.5 → vigilance z>1.5 (sensitive)
+    #   threshold=3.0 → vigilance z>3.0 (default)
+    #   threshold=6.0 → vigilance z>6.0 (strict)
     fg_scores = z_scores[z_scores > 0]
 
     if fg_scores.size == 0:
@@ -92,19 +97,14 @@ def create_dicom_seg(
         vigilance_threshold = 999.0
         alert_threshold = 999.0
     else:
-        # Map user slider (1.5–6.0) to percentiles
-        # threshold=3.0 (default) → vigilance at p95, alert at p96.5
-        # threshold=1.5 (sensitive) → vigilance at p92.5, alert at p94
-        # threshold=6.0 (strict) → vigilance at p100 (capped at p99.9)
-        pct_vigilance = min(90 + threshold * (10.0 / 6.0), 99.9)
-        pct_alert = min(pct_vigilance + 1.5, 99.95)
+        vigilance_threshold = threshold
+        alert_threshold = threshold + 2.0
 
-        vigilance_threshold = np.percentile(fg_scores, pct_vigilance)
-        alert_threshold = np.percentile(fg_scores, pct_alert)
-
-        print(f"  Thresholds: vigilance={vigilance_threshold:.6f} "
-              f"(p{pct_vigilance:.1f}), "
-              f"alert={alert_threshold:.6f} (p{pct_alert:.1f})")
+        print(f"  Thresholds: vigilance=z>{vigilance_threshold:.1f}, "
+              f"alert=z>{alert_threshold:.1f}  "
+              f"(fg scores: p95={np.percentile(fg_scores, 95):.2f}, "
+              f"p99={np.percentile(fg_scores, 99):.2f}, "
+              f"max={fg_scores.max():.2f})")
 
     # Segment 1: "vigilance" zone
     mask_vigilance = z_scores > vigilance_threshold
