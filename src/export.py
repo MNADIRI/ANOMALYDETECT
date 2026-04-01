@@ -15,22 +15,24 @@ from pydicom.uid import generate_uid
 from scipy.ndimage import binary_opening, binary_closing, binary_fill_holes, label
 
 
-def _clean_mask(mask: np.ndarray, min_component_size: int = 20) -> np.ndarray:
-    """Morphological cleanup: remove noise, fill holes, remove small components."""
+def _clean_mask(mask: np.ndarray, min_component_size: int = 10) -> np.ndarray:
+    """Morphological cleanup: remove noise, fill holes, remove small components.
+
+    Uses per-slice 2D operations to preserve thin z-structures (small
+    hemorrhages spanning only 1-3 slices would be destroyed by 3D erosion).
+    """
     if not mask.any():
         return mask
-    # Close small gaps (dilation then erosion)
-    mask = binary_closing(mask, iterations=2)
-    # Fill internal holes per slice (3D fill can leak across slices)
+    # Per-slice 2D closing + hole filling (preserves z-thickness)
     for s in range(mask.shape[0]):
-        mask[s] = binary_fill_holes(mask[s])
-    # Remove small isolated 3D components
+        if mask[s].any():
+            mask[s] = binary_closing(mask[s], iterations=1)
+            mask[s] = binary_fill_holes(mask[s])
+    # 3D connected component filter (remove tiny isolated clusters)
     labeled, n_comp = label(mask)
     for c in range(1, n_comp + 1):
         if (labeled == c).sum() < min_component_size:
             mask[labeled == c] = False
-    # Open to smooth edges (erosion then dilation)
-    mask = binary_opening(mask, iterations=1)
     return mask.astype(bool)
 
 
