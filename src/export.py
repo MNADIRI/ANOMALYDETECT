@@ -12,6 +12,28 @@ import numpy as np
 import pydicom
 from pydicom.sr.codedict import codes
 from pydicom.uid import generate_uid
+from scipy.ndimage import binary_opening, binary_closing, binary_fill_holes, label
+
+
+def _clean_mask(mask: np.ndarray, min_component_size: int = 10) -> np.ndarray:
+    """Morphological cleanup: remove noise, fill holes, remove small components.
+
+    Uses per-slice 2D operations to preserve thin z-structures (small
+    hemorrhages spanning only 1-3 slices would be destroyed by 3D erosion).
+    """
+    if not mask.any():
+        return mask
+    # Per-slice 2D closing + hole filling (preserves z-thickness)
+    for s in range(mask.shape[0]):
+        if mask[s].any():
+            mask[s] = binary_closing(mask[s], iterations=1)
+            mask[s] = binary_fill_holes(mask[s])
+    # 3D connected component filter (remove tiny isolated clusters)
+    labeled, n_comp = label(mask)
+    for c in range(1, n_comp + 1):
+        if (labeled == c).sum() < min_component_size:
+            mask[labeled == c] = False
+    return mask.astype(bool)
 
 
 def create_dicom_seg(
@@ -25,9 +47,9 @@ def create_dicom_seg(
 
     Parameters
     ----------
-    z_scores : [D, H, W] float32 at native resolution
+    z_scores : [D, H, W] float32 at native resolution (z-score values)
     source_dicom_files : sorted list of .dcm paths for scan T
-    threshold : z-score threshold for flagging
+    threshold : z-score threshold for vigilance (alert = threshold * 1.5)
     output_path : where to write the .dcm
 
     Returns
@@ -64,66 +86,86 @@ def create_dicom_seg(
             np.float32
         )
 
-    # Create binary masks
-    # Segment 1: "vigilance" zone – z > threshold
-    mask_vigilance = z_scores > threshold
-    # Segment 2: "alert" zone – z > threshold * 1.5
-    mask_alert = z_scores > (threshold * 1.5)
+    # Absolute z-score thresholding
+    # Scores from scoring.py are already z-scores (global median + MAD normalized).
+    # The user slider directly controls the z-score cutoff:
+    #   threshold=1.5 → vigilance z>1.5 (sensitive)
+    #   threshold=3.0 → vigilance z>3.0 (default)
+    #   threshold=6.0 → vigilance z>6.0 (strict)
+    fg_scores = z_scores[z_scores > 0]
 
-    # Remove alert areas from vigilance (so they don't overlap)
+    if fg_scores.size == 0:
+        print("  No foreground scores — generating minimal SEG")
+        vigilance_threshold = 999.0
+        alert_threshold = 999.0
+    else:
+        vigilance_threshold = threshold
+        alert_threshold = threshold + 2.0
+
+        print(f"  Thresholds: vigilance=z>{vigilance_threshold:.1f}, "
+              f"alert=z>{alert_threshold:.1f}  "
+              f"(fg scores: p95={np.percentile(fg_scores, 95):.2f}, "
+              f"p99={np.percentile(fg_scores, 99):.2f}, "
+              f"max={fg_scores.max():.2f})")
+
+    # Segment 1: "vigilance" zone
+    mask_vigilance = z_scores > vigilance_threshold
+    # Segment 2: "alert" zone
+    mask_alert = z_scores > alert_threshold
+
+    # Morphological cleanup — fill holes, remove noise, smooth edges
+    mask_vigilance = _clean_mask(mask_vigilance)
+    mask_alert = _clean_mask(mask_alert)
+
+    # Remove alert areas from vigilance (no overlap)
     mask_vigilance_only = mask_vigilance & ~mask_alert
 
     has_vigilance = mask_vigilance_only.any()
     has_alert = mask_alert.any()
 
+    print(f"  Vigilance voxels: {mask_vigilance_only.sum()}, "
+          f"Alert voxels: {mask_alert.sum()}")
+
     if not has_vigilance and not has_alert:
-        # Lower threshold to get at least some detections
-        # Use a percentile-based approach
-        p95 = np.percentile(z_scores, 95)
-        if p95 > 1.0:
-            mask_vigilance_only = z_scores > p95
-            mask_alert = z_scores > np.percentile(z_scores, 99)
-            mask_vigilance_only = mask_vigilance_only & ~mask_alert
-            has_vigilance = mask_vigilance_only.any()
-            has_alert = mask_alert.any()
+        print("  No voxels above threshold — generating minimal SEG file")
 
     # Build segment descriptions
     segments = []
     masks = []
 
-    if has_vigilance or not has_alert:
-        # Always include at least one segment
-        seg_vigilance = hd.seg.SegmentDescription(
-            segment_number=1,
-            segment_label="Zone de vigilance",
-            segmented_property_category=codes.SCT.MorphologicallyAbnormalStructure,
-            segmented_property_type=codes.SCT.Neoplasm,
-            algorithm_type=hd.seg.SegmentAlgorithmTypeValues.AUTOMATIC,
-            algorithm_identification=hd.AlgorithmIdentification(
-                name="CT Control Volume",
-                version="1.0",
-            ),
-            tracking_uid=generate_uid(),
-            tracking_id="vigilance_zone",
-        )
-        segments.append(seg_vigilance)
-        if not mask_vigilance_only.any():
-            # Create a minimal mask (single voxel) to avoid empty segment
-            mask_vigilance_only = z_scores > np.percentile(z_scores, 99.5)
-            if not mask_vigilance_only.any():
-                mask_vigilance_only[0, 0, 0] = True
-        masks.append(mask_vigilance_only)
+    # Always include at least the vigilance segment (highdicom requires >= 1)
+    seg_vigilance = hd.seg.SegmentDescription(
+        segment_number=1,
+        segment_label="Zone de vigilance",
+        segmented_property_category=codes.SCT.MorphologicallyAbnormalStructure,
+        segmented_property_type=codes.SCT.Neoplasm,
+        algorithm_type=hd.seg.SegmentAlgorithmTypeValues.AUTOMATIC,
+        algorithm_identification=hd.AlgorithmIdentificationSequence(
+            name="CT Control Volume",
+            version="1.0",
+            family=codes.cid7162.ArtificialIntelligence,
+        ),
+        tracking_uid=generate_uid(),
+        tracking_id="vigilance_zone",
+    )
+    segments.append(seg_vigilance)
+    if not mask_vigilance_only.any():
+        # Empty mask — no false positives
+        mask_vigilance_only = np.zeros_like(z_scores, dtype=bool)
+        mask_vigilance_only[0, 0, 0] = True  # minimal single voxel for validity
+    masks.append(mask_vigilance_only)
 
     if has_alert:
         seg_alert = hd.seg.SegmentDescription(
-            segment_number=len(segments) + 1,
+            segment_number=2,
             segment_label="Zone d'alerte",
             segmented_property_category=codes.SCT.MorphologicallyAbnormalStructure,
             segmented_property_type=codes.SCT.Neoplasm,
             algorithm_type=hd.seg.SegmentAlgorithmTypeValues.AUTOMATIC,
-            algorithm_identification=hd.AlgorithmIdentification(
+            algorithm_identification=hd.AlgorithmIdentificationSequence(
                 name="CT Control Volume",
                 version="1.0",
+                family=codes.cid7162.ArtificialIntelligence,
             ),
             tracking_uid=generate_uid(),
             tracking_id="alert_zone",
@@ -131,8 +173,8 @@ def create_dicom_seg(
         segments.append(seg_alert)
         masks.append(mask_alert)
 
-    # Stack masks: [n_segments, D, H, W] as boolean
-    pixel_array = np.stack(masks, axis=0).astype(np.uint8)
+    # highdicom 0.27 expects pixel_array shape [D, H, W, n_segments] for BINARY
+    pixel_array = np.stack(masks, axis=-1).astype(np.bool_)
 
     # Create the DICOM SEG
     seg = hd.seg.Segmentation(
@@ -150,7 +192,7 @@ def create_dicom_seg(
         device_serial_number="0001",
         series_description="AI Control Volume - Change Detection",
         content_description="Automated change detection between CT scans",
-        content_creator_name="CT Control Volume Pipeline",
+        content_creator_name="CT Control Volume^Pipeline",
     )
 
     seg.save_as(output_path)

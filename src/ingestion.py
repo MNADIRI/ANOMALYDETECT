@@ -1,6 +1,6 @@
 """
 DICOM ingestion: reads a folder of DICOM CT files and produces
-standardised HU volumes and triple-windowed 3-channel volumes.
+standardised HU volumes and adaptive 3-channel windowed volumes.
 """
 
 import os
@@ -12,8 +12,83 @@ import SimpleITK as sitk
 
 
 # ---------------------------------------------------------------------------
-# Triple windowing helpers
+# Region-aware HU windowing
 # ---------------------------------------------------------------------------
+
+REGION_PRESETS = {
+    "brain": [
+        ("brain",    40,   80),    # parenchyme vs hémorragie — Δ max
+        ("subdural", 60,  200),    # vision élargie tissus mous + sang
+        ("bone",    500, 2500),    # crâne, calcifications
+    ],
+    "chest": [
+        ("mediastinum", 40,  400),
+        ("lung",      -600, 1500),
+        ("bone",       300, 1500),
+    ],
+    "abdomen": [
+        ("soft",  40,  400),
+        ("lung", -600, 1500),
+        ("bone",  300, 1500),
+    ],
+}
+REGION_PRESETS["default"] = REGION_PRESETS["abdomen"]
+
+
+def detect_body_region(volume_hu: np.ndarray, metadata: dict) -> str:
+    """
+    Detect body region from DICOM tags or HU histogram analysis.
+
+    Priority:
+      1. DICOM BodyPartExamined / StudyDescription tags
+      2. HU histogram heuristic (brain vs chest vs abdomen)
+    """
+    # --- Try DICOM tags first ---
+    body_part = metadata.get("body_part_examined", "").upper()
+    study_desc = metadata.get("study_description", "").upper()
+
+    tag_text = f"{body_part} {study_desc}"
+    brain_keywords = ["HEAD", "BRAIN", "CRANE", "CEREBR", "TETE", "CRÂNE"]
+    chest_keywords = ["CHEST", "THORAX", "LUNG", "PULMON", "THORAC"]
+    abdomen_keywords = ["ABDOMEN", "ABDOM", "PELVI"]
+
+    for kw in brain_keywords:
+        if kw in tag_text:
+            return "brain"
+    for kw in chest_keywords:
+        if kw in tag_text:
+            return "chest"
+    for kw in abdomen_keywords:
+        if kw in tag_text:
+            return "abdomen"
+
+    # --- HU histogram heuristic ---
+    # Sample middle slices for speed
+    D = volume_hu.shape[0]
+    mid = D // 2
+    sample = volume_hu[max(0, mid - 5):mid + 5]
+    flat = sample.ravel()
+    # Only consider tissue range
+    tissue = flat[(flat > -100) & (flat < 200)]
+
+    if tissue.size == 0:
+        return "default"
+
+    # Brain: tight distribution centred around 20-45 HU, no lung peak
+    std_tissue = np.std(tissue)
+    mean_tissue = np.mean(tissue)
+
+    # Check for lung air peak (strong indicator of chest)
+    air_voxels = flat[(flat > -900) & (flat < -400)]
+    air_fraction = air_voxels.size / max(flat.size, 1)
+
+    if air_fraction > 0.15:
+        return "chest"
+    if std_tissue < 40 and 10 < mean_tissue < 60:
+        return "brain"
+
+    return "default"
+
 
 def _apply_window(hu: np.ndarray, center: float, width: float) -> np.ndarray:
     """Apply a single HU window and normalise to [0, 1]."""
@@ -24,30 +99,44 @@ def _apply_window(hu: np.ndarray, center: float, width: float) -> np.ndarray:
     return out.astype(np.float32)
 
 
-def _triple_window(hu: np.ndarray) -> np.ndarray:
+def adaptive_triple_channel(
+    hu_volume: np.ndarray,
+    metadata: dict,
+    body_region: str | None = None,
+) -> tuple[np.ndarray, str]:
     """
-    Convert an HU volume [D, H, W] to a 3-channel volume [D, 3, H, W].
+    Convert HU volume [D, H, W] → 3-channel [D, 3, H, W].
 
-    Channels:
-        0 (R) – abdomen: center=40,  width=400
-        1 (G) – lung:    center=-600, width=1500
-        2 (B) – bone:    center=300,  width=1500
+    Uses region-specific HU windows normalised to [0, 1].
+    Returns (volume_3ch, detected_region).
     """
-    r = _apply_window(hu, center=40, width=400)
-    g = _apply_window(hu, center=-600, width=1500)
-    b = _apply_window(hu, center=300, width=1500)
-    return np.stack([r, g, b], axis=1)  # [D, 3, H, W]
+    if body_region is None:
+        body_region = detect_body_region(hu_volume, metadata)
+
+    preset = REGION_PRESETS.get(body_region, REGION_PRESETS["default"])
+    print(f"  Body region: {body_region} → windows: "
+          f"{[(n, c, w) for n, c, w in preset]}")
+
+    channels = []
+    for name, center, width in preset:
+        windowed = _apply_window(hu_volume, center, width)
+        channels.append(windowed)
+        print(f"    Channel '{name}': range [{windowed.min():.3f}, {windowed.max():.3f}]")
+
+    volume_3ch = np.stack(channels, axis=1)  # [D, 3, H, W]
+    return volume_3ch, body_region
 
 
 # ---------------------------------------------------------------------------
 # Main ingestion function
 # ---------------------------------------------------------------------------
 
-TARGET_SIZE = 512  # in-plane pixel size for the prototype
+TARGET_SIZE = 518  # 37 × 14 — DINOv2 ViT-B14 native (no padding needed)
 
 
 def ingest_dicom_folder(
     dicom_dir: str,
+    body_region: str | None = None,
 ) -> tuple[np.ndarray, np.ndarray, dict]:
     """
     Read a DICOM folder and produce a standardised volume.
@@ -64,11 +153,24 @@ def ingest_dicom_folder(
     """
     # 1. Collect all DICOM files -------------------------------------------
     dcm_paths = []
+    skip_names = {"dicomdir", "dicomdir."}
     for root, _dirs, files in os.walk(dicom_dir):
         for fname in files:
+            # Skip DICOMDIR index files and hidden files
+            if fname.lower().rstrip(".") in skip_names:
+                continue
+            if fname.startswith("."):
+                continue
             fpath = os.path.join(root, fname)
             if fname.lower().endswith(".dcm") or "." not in fname:
                 dcm_paths.append(fpath)
+            else:
+                # Try to read any file — DICOM files don't always have .dcm extension
+                try:
+                    pydicom.dcmread(fpath, stop_before_pixels=True, force=True)
+                    dcm_paths.append(fpath)
+                except Exception:
+                    pass
 
     if not dcm_paths:
         raise ValueError(f"No DICOM files found in {dicom_dir}")
@@ -77,13 +179,23 @@ def ingest_dicom_folder(
     headers = []
     for p in dcm_paths:
         try:
-            ds = pydicom.dcmread(p, stop_before_pixels=True)
+            ds = pydicom.dcmread(p, stop_before_pixels=True, force=True)
+            # Skip files without pixel data indicators (DICOMDIR, SR, etc.)
+            has_rows = hasattr(ds, "Rows")
+            has_cols = hasattr(ds, "Columns")
+            if not (has_rows and has_cols):
+                continue
             headers.append((p, ds))
         except Exception:
             continue
 
     if not headers:
-        raise ValueError(f"No readable DICOM files in {dicom_dir}")
+        raise ValueError(
+            f"No readable DICOM image files in {dicom_dir}. "
+            f"Found {len(dcm_paths)} files but none contain image data. "
+            f"Make sure to provide the folder with the actual CT slices, "
+            f"not just the DICOMDIR file."
+        )
 
     # 3. Filter CT only, pick largest series -------------------------------
     ct_headers = [
@@ -91,7 +203,7 @@ def ingest_dicom_folder(
         if getattr(ds, "Modality", "").upper() == "CT"
     ]
     if not ct_headers:
-        # Fallback: use all files if no Modality tag
+        # Fallback: use all files with image data if no CT Modality tag
         ct_headers = headers
 
     series_counter = Counter(
@@ -191,10 +303,7 @@ def ingest_dicom_folder(
     resampled = resampler.Execute(sitk_image)
     volume_hu = sitk.GetArrayFromImage(resampled).astype(np.float32)  # [D, H, W]
 
-    # 8. Triple windowing ---------------------------------------------------
-    volume_3ch = _triple_window(volume_hu)  # [D, 3, H, W]
-
-    # 9. Metadata -----------------------------------------------------------
+    # 8. Metadata (build early so adaptive windowing can read DICOM tags) ----
     metadata = {
         "spacing": (
             new_spacing[2],  # sz
@@ -206,6 +315,8 @@ def ingest_dicom_folder(
         "patient_id": str(getattr(ds0, "PatientID", "UNKNOWN")),
         "study_date": str(getattr(ds0, "StudyDate", "")),
         "series_uid": str(getattr(ds0, "SeriesInstanceUID", "")),
+        "body_part_examined": str(getattr(ds0, "BodyPartExamined", "")),
+        "study_description": str(getattr(ds0, "StudyDescription", "")),
         "source_files": sorted_paths,
         "original_shape": original_shape,
         "sitk_reference": resampled,  # keep for registration
@@ -213,5 +324,11 @@ def ingest_dicom_folder(
         "original_origin": origin_vals,
         "original_direction": sitk_image.GetDirection(),
     }
+
+    # 9. Adaptive CLAHE windowing -------------------------------------------
+    volume_3ch, detected_region = adaptive_triple_channel(
+        volume_hu, metadata, body_region=body_region,
+    )
+    metadata["body_region"] = detected_region
 
     return volume_3ch, volume_hu, metadata
